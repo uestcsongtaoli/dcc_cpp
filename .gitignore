@@ -15,5 +15,10 @@ server.log
 # macOS
 .DS_Store
 
-# Claude
-.claude/
+# Claude — track settings but not conversation history
+.claude/*
+!.claude/settings.json
+
+# autoresearch runtime (never commit)
+results.tsv
+run.log
