@@ -17,18 +17,16 @@ We implement a local HTTP service with:
 - `GET /health`
 - `POST /encrypt`
 
-The evaluator sends 100 concurrent `/encrypt` requests. Each request contains:
+The evaluator sends 100 concurrent `/encrypt` requests simultaneously. Each request is independent and carries:
 
-```json
-{
-  "requestId": "REQ_001",
-  "sm4Key": "8656ae6acdb820f3",
-  "ip": "127.0.0.1",
-  "fieldsToEncrypt": ["trans_id", "secret_code"]
-}
-```
+- a unique `requestId`
+- its own random `sm4Key` (16-byte, differs across requests)
+- a random subset of the 11 fields to process (`fieldsToEncrypt`, **3–7 fields per request**, differs across requests; SM4-encrypted fields account for ~70% of selected fields)
 
-For each request, the service reads the source CSV (300,000 rows × 11 fields), encrypts or masks the requested fields, writes an output CSV, then calls back the evaluator.
+The 11 fields are: `user_id`, `serial_no`, `user_code`, `business_key`, `id_card`, `phone`, `name`, `email`, `device_id`, `trans_id`, `secret_code`.
+Of these, 7 are SM4-CBC encrypted; 4 (`id_card`, `phone`, `name`, `email`) are masked instead.
+
+For each request, the service reads the shared source CSV, processes only the requested fields (encrypt or mask per field type), writes one output CSV file (must be explicitly `close()`d), then calls back the evaluator.
 
 The primary metric is: **total wall-clock time from the first `/encrypt` received to the last one fully processed**. Lower is better.
 
@@ -50,10 +48,41 @@ Hard constraints:
 
 ## 2. Target Environment
 
-- **Development machine**: macOS, any architecture (for iteration speed)
-- **Competition machine**: x86\_64 Linux, 4 cores / 8 GB RAM, AVX-512F available
-- **Compilation**: static linking on Linux (`./build.sh` detects OS automatically)
-- **Binary**: `build/dcc_encrypt`
+### Development machine
+macOS, any architecture — used for fast iteration. `wall_ms` values on Mac are not representative of competition performance (Mac has no AVX-512, and fewer/different cores).
+
+### Competition machine (authoritative)
+| Item | Value |
+|------|-------|
+| CPU | Intel Xeon Gold 5218 @ 2.30GHz |
+| vCPUs | **4** (2 physical cores × 2 hyperthreads) |
+| Memory | 7.6 GB RAM + 4 GB swap |
+| Kernel | Linux 3.10.0 (CentOS 7 / RHEL7) |
+| Compiler | GCC 11.2.1 (Red Hat), g++ 11.2.1 |
+| Disk write | ~700 MB/s (dd sequential) |
+| Disk read | ~2.6 GB/s |
+
+**Available SIMD instruction sets** (confirmed from `/proc/cpuinfo`):
+```
+avx2        avx512f     avx512bw    avx512vl
+avx512dq    avx512cd    avx512_vnni
+pclmulqdq   aes         fma
+```
+
+**What this means for optimization:**
+- `hardware_concurrency()` returns **4** on this machine (4 vCPUs).
+- Physical cores = 2; hyperthreading means >4 threads rarely helps for CPU-bound SM4 work — may hurt due to cache sharing between HT siblings.
+- AVX-512 is confirmed available: the 16-way parallel path in `sm4_avx512.cpp` will activate.
+- For compiler flags: `-march=cascadelake` targets this CPU generation exactly. `-march=skylake-avx512` also works.
+- Output files are buffered; `close()` pushes to kernel page cache (fast). Actual disk flush is async — no `fsync()` needed.
+
+### Input data scale
+- **Current dev data**: 300,000 rows × 11 fields (~41 MB CSV)
+- **Validation data may be larger** (up to ~500,000 rows) and changes every two weeks during the competition.
+- **Do NOT hardcode row counts.** All code must use `g_rows.size()` dynamically. Optimizations must scale linearly with row count.
+
+### Compilation
+Static linking on Linux (`./build.sh` detects OS automatically). Binary: `build/dcc_encrypt`.
 
 ---
 
@@ -213,10 +242,10 @@ These are starting hypotheses. Explore them in any order. Combine ideas. Invent 
 - **Unrolled inner loop**: manually unroll the 32-round SM4 loop to reduce branch overhead.
 
 ### Thread & Concurrency
-- **Worker count tuning**: `hardware_concurrency()` may not be optimal. Try 2×, 4×, or a fixed value like 8 or 16. More threads help if encryption is the bottleneck; too many hurt due to lock contention and cache thrashing.
+- **Worker count tuning**: the competition machine has 4 vCPUs / 2 physical cores. The current default (`hardware_concurrency()` = 4) is a reasonable start, but HT siblings share L1/L2 cache. With SM4 T-box lookups being cache-sensitive, try values of 2, 3, 4 — more than 4 is unlikely to help on this machine.
 - **Per-field parallel dispatch**: instead of one job per request (all fields sequential), dispatch one job per (request × SM4-field) for finer-grained parallelism.
 - **Lock-free task queue**: replace `std::queue` + `std::mutex` in `ThreadPool` with a lock-free ring buffer to reduce contention under 100 concurrent submissions.
-- **NUMA / cache pinning**: pin worker threads to specific cores to improve cache locality.
+- **Batch multiple requests into one job**: group N requests together in one worker job to share instruction cache and avoid repeated dispatch overhead.
 
 ### I/O & Output
 - **Large write buffer**: replace line-by-line `ofs <<` with an in-memory string buffer; write the whole output in one `fwrite`. Reduces syscall count from 300K to 1.
@@ -231,11 +260,12 @@ These are starting hypotheses. Explore them in any order. Combine ideas. Invent 
 - **PKCS7 padding precomputation**: pad all plaintexts to block boundary once at CSV load time (key-independent). Reduces per-request work.
 
 ### Build & Compiler
-- **`-O3` instead of `-O2`**: enable more aggressive optimizations.
-- **`-march=native`**: let the compiler use all available ISA extensions.
-- **`-funroll-loops`**: unroll small loops in sm4.cpp.
-- **Link-time optimization (LTO)**: `-flto` enables cross-TU inlining (e.g. `sm4_cbc_encrypt_into` inlined into the hot loop).
-- **Profile-guided optimization (PGO)**: instrument, run bench, recompile with profile data.
+- **`-O3` instead of `-O2`**: enable more aggressive auto-vectorization and loop transforms.
+- **`-march=cascadelake`**: targets the exact Xeon Gold 5218 microarchitecture; enables all confirmed ISA extensions. Prefer this over `-march=native` for reproducibility across the 4 competition servers.
+- **`-funroll-loops`**: unroll the 32-round SM4 inner loop.
+- **`-fprofile-generate` / `-fprofile-use`** (PGO): instrument, run bench once, recompile with profile data for branch layout optimization.
+- **Link-time optimization (LTO)**: `-flto` enables cross-TU inlining (e.g. `sm4_cbc_encrypt_into` inlined into the scalar hot loop in `main.cpp`).
+- **`-ffast-math`**: safe here — no floating-point in the hot path.
 
 ### Architecture
 - **Pre-warm CSV on first `/health`**: load CSV in a background thread immediately after `/health` succeeds (before any `/encrypt` arrives). Amortizes CSV load time.
