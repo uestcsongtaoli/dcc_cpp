@@ -1,0 +1,19 @@
+# Build artifacts
+build/
+dcc_encrypt
+*.zip
+
+# Data files (large / generated)
+data/table_data.csv
+data/test_input.csv
+
+# Runtime files
+server.log
+.server.pid
+/tmp/
+
+# macOS
+.DS_Store
+
+# Claude
+.claude/
