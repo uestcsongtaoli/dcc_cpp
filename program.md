@@ -72,8 +72,9 @@ pclmulqdq   aes         fma
 **What this means for optimization:**
 - `hardware_concurrency()` returns **4** on this machine (4 vCPUs).
 - Physical cores = 2; hyperthreading means >4 threads rarely helps for CPU-bound SM4 work — may hurt due to cache sharing between HT siblings.
-- AVX-512 is confirmed available: the 16-way parallel path in `sm4_avx512.cpp` will activate.
-- For compiler flags: `-march=cascadelake` targets this CPU generation exactly. `-march=skylake-avx512` also works.
+- The current code may contain an AVX-512 path, but do not assume it is optimal.
+Measure before relying on it.
+- You may replace, simplify, or remove an existing optimization if benchmark proves it faster and correctness remains intact.
 - Output files are buffered; `close()` pushes to kernel page cache (fast). Actual disk flush is async — no `fsync()` needed.
 
 ### Input data scale
@@ -217,8 +218,20 @@ Run on a dedicated branch (e.g. `autoresearch/may10`).
    - For server crash: `grep "ERROR\|exception" run.log` for clues
    - After more than 2 failed fix attempts on the same idea: give up, `git reset --hard HEAD~1`, log `crash`
 9. **If `eval_status` is `ok`**:
-   - If `wall_ms` < previous best → **keep**: log `keep`, advance the branch
-   - If `wall_ms` ≥ previous best → **discard**: `git reset --hard HEAD~1`, log `discard`
+
+   Let `prev` = wall_ms of the current best (last `keep` row in results.tsv).
+   Let `delta_pct` = (prev − wall_ms) / prev × 100.
+
+   | delta_pct | Action |
+   |-----------|--------|
+   | < 0 (regression) | **discard** immediately |
+   | 0 – 0.5% | **discard** — improvement too small to be real, treat as noise |
+   | 0.5% – 3% | Run `./eval.sh > run.log 2>&1` **two more times** (3 total). Take the **median** wall_ms of all 3 runs. If median < prev → **keep**; else → **discard** |
+   | ≥ 3% | **keep** after this single run — improvement is unambiguous |
+
+   On **keep**: log the final wall_ms used (single run or median) to results.tsv, advance the branch.
+   On **discard**: `git reset --hard HEAD~1`, log `discard`.
+
 10. Append row to `results.tsv`
 11. Repeat
 
