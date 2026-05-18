@@ -5,7 +5,6 @@ dcc_encrypt
 
 # Data files (large / generated)
 data/table_data.csv
-data/test_input.csv
 
 # Runtime files
 server.log
