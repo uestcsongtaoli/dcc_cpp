@@ -25,6 +25,7 @@
 #include <unistd.h>
 #include <signal.h>
 #include <cpuid.h>
+#include <immintrin.h>
 #include "sm4.h"
 #include "sm4_avx512.h"
 
@@ -594,6 +595,67 @@ static bool http_post(const std::string& url, const std::string& body) {
     return ok;
 }
 
+// ─── Vectorized hex encoder (AVX2) ───────────────────────────────────────────
+//
+// hex16_avx2: 16 bytes → 32 uppercase hex chars, one AVX2 store.
+//
+// Algorithm (all ops run in 256-bit AVX2):
+//  1. Broadcast the 16 input bytes into both 128-bit lanes of a ymm register.
+//  2. Extract high nibbles  (>> 4 within each 16-bit element, then & 0x0f).
+//  3. Extract low  nibbles  (& 0x0f).
+//  4. Translate nibbles to ASCII via vpshufb against "0123456789ABCDEF" LUT.
+//  5. Interleave hi/lo chars within each 128-bit lane:
+//       lane 0 → chars for input bytes 0-7  (16 bytes)
+//       lane 1 → chars for input bytes 8-15 (16 bytes)
+//  6. Permute lanes into sequential order → 32-byte ymm store.
+//
+// hex_encode: loops hex16_avx2 over n bytes (n must be a multiple of 16).
+// All SM4-CBC ciphertext satisfies this: block size = 16, PKCS7 always pads
+// to a 16-byte multiple.
+
+static inline void hex16_avx2(const uint8_t* __restrict__ src,
+                               char*          __restrict__ dst) {
+    // LUT: byte i = ASCII char for nibble value i  ('0'..'9','A'..'F')
+    const __m256i lut  = _mm256_broadcastsi128_si256(
+        _mm_set_epi8('F','E','D','C','B','A','9','8',
+                     '7','6','5','4','3','2','1','0'));
+    const __m256i mask = _mm256_set1_epi8(0x0f);
+
+    // Broadcast 16 input bytes into both 128-bit lanes.
+    __m256i data = _mm256_broadcastsi128_si256(
+                       _mm_loadu_si128((const __m128i*)src));
+
+    // Isolate nibbles.  _mm256_srli_epi16 shifts within each 16-bit element;
+    // masking with 0x0f then gives the correct high nibble of every byte.
+    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
+    __m256i lo = _mm256_and_si256(data, mask);
+
+    // Translate nibbles → ASCII.
+    __m256i hi_c = _mm256_shuffle_epi8(lut, hi);
+    __m256i lo_c = _mm256_shuffle_epi8(lut, lo);
+
+    // Interleave (within each 128-bit lane):
+    //   unpacklo → chars for input bytes 0-3  (lane 0) / 8-11  (lane 1)
+    //   unpackhi → chars for input bytes 4-7  (lane 0) / 12-15 (lane 1)
+    __m256i u_lo = _mm256_unpacklo_epi8(hi_c, lo_c);
+    __m256i u_hi = _mm256_unpackhi_epi8(hi_c, lo_c);
+
+    // Permute so that lane 0 of result = chars for bytes 0-7,
+    //                  lane 1 of result = chars for bytes 8-15.
+    // imm8=0x20: result_lane0 = u_lo_lane0, result_lane1 = u_hi_lane0.
+    _mm256_storeu_si256((__m256i*)dst,
+        _mm256_permute2x128_si256(u_lo, u_hi, 0x20));
+}
+
+// Encode `n` bytes of SM4 ciphertext as uppercase hex into `dst`.
+// n must be a multiple of 16 (guaranteed by SM4 PKCS7 padding).
+static inline void hex_encode(const uint8_t* __restrict__ src,
+                               char*          __restrict__ dst,
+                               size_t n) {
+    for (size_t i = 0; i < n; i += 16)
+        hex16_avx2(src + i, dst + i * 2);
+}
+
 // ─── Encrypt job ─────────────────────────────────────────────────────────────
 
 static void do_encrypt(std::string requestId, std::string ip,
@@ -633,7 +695,6 @@ static void do_encrypt(std::string requestId, std::string ip,
         TLOG("%-32s  file_open=%6.2fms", requestId.c_str(), tms(t_init, t_open));
 
         // ── 5. Encrypt rows ────────────────────────────────────────────────
-        static const char HEX[] = "0123456789ABCDEF";
         const size_t nrows = g_rows.size();
 
         // Shared scalar helper: build one complete output line for row_idx.
@@ -652,10 +713,7 @@ static void do_encrypt(std::string requestId, std::string ip,
                                         (const uint8_t*)val.data(), val.size(), ct_buf);
                         size_t s = ln.size();
                         ln.resize(s + cl * 2);
-                        for (size_t k = 0; k < cl; ++k) {
-                            ln[s + k*2]   = HEX[ct_buf[k] >> 4];
-                            ln[s + k*2+1] = HEX[ct_buf[k] & 0xf];
-                        }
+                        hex_encode(ct_buf, ln.data() + s, cl);
                     }
                 } else {
                     ln += g_masked_col[fi.col - 4][row_idx];
@@ -694,16 +752,13 @@ static void do_encrypt(std::string requestId, std::string ip,
                             pt_l[b] = val.size();
                         }
                         sm4_cbc_encrypt_x16(ctx, SM4_IV, pt_p, pt_l, ct_p, ct_l);
-                        // Hex-encode into per-row line buffers.
+                        // Hex-encode into per-row line buffers (AVX2).
                         for (size_t b = 0; b < B; ++b) {
                             if (fi_i > 0) lbufs[b] += ',';
                             if (ct_l[b] == 0) continue;
                             size_t s = lbufs[b].size();
                             lbufs[b].resize(s + ct_l[b] * 2);
-                            for (size_t k = 0; k < ct_l[b]; ++k) {
-                                lbufs[b][s + k*2]   = HEX[ct_s[b][k] >> 4];
-                                lbufs[b][s + k*2+1] = HEX[ct_s[b][k] & 0xf];
-                            }
+                            hex_encode(ct_s[b], lbufs[b].data() + s, ct_l[b]);
                         }
                     } else {
                         // Precomputed mask lookup — zero compute, zero alloc.
