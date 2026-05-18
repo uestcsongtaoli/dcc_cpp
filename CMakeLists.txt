@@ -8,8 +8,8 @@ if(NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -DNDEBUG")
-set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0")
+set(CMAKE_CXX_FLAGS_RELEASE "-O3 -march=cascadelake -funroll-loops -DNDEBUG")
+set(CMAKE_CXX_FLAGS_DEBUG   "-g -O0 -march=cascadelake")
 
 find_package(Threads REQUIRED)
 
@@ -19,10 +19,11 @@ add_executable(dcc_encrypt
     src/sm4_avx512.cpp
 )
 
-# x86_64-only build: AVX-512F is always required.
+# -march=cascadelake (global) already enables AVX-512F/BW/VL/DQ/VNNI/CD.
+# The per-file -mavx512f is redundant but kept as an explicit marker.
 set_source_files_properties(src/sm4_avx512.cpp PROPERTIES
     COMPILE_FLAGS "-mavx512f")
-message(STATUS "AVX-512F: enabled (-mavx512f)")
+message(STATUS "AVX-512F: enabled (via -march=cascadelake + per-file -mavx512f)")
 
 target_include_directories(dcc_encrypt PRIVATE src)
 target_link_libraries(dcc_encrypt PRIVATE Threads::Threads)
