@@ -38,6 +38,7 @@ static bool        g_debug      = false;  // DCC_DEBUG=1 to enable
 static bool        g_hw_info    = false;  // DCC_HW_INFO=1 to enable
 static bool        g_csv_stats  = false;  // DCC_CSV_STATS=1 to enable
 static int         g_port       = 8080;   // DCC_PORT=<n>
+static int         g_workers    = 0;      // DCC_WORKERS=<n>  0 = hardware_concurrency()
 
 // ─── Timing helpers ───────────────────────────────────────────────────────────
 
@@ -1037,6 +1038,7 @@ int main() {
     g_csv_stats    = (env("DCC_CSV_STATS", "0") == "1");
     g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));  // 0 = disable [BATCH] summary
     g_port         = std::stoi(env("DCC_PORT",         "8080"));
+    g_workers      = std::stoi(env("DCC_WORKERS",      "0"));
 
     if (g_hw_info)   print_hw_info();
     if (g_csv_stats) ensure_csv();   // eager load → triggers analyze_csv_stats()
@@ -1046,9 +1048,11 @@ int main() {
 
     signal(SIGPIPE, SIG_IGN); // don't crash on broken socket writes
 
-    // Worker thread pool: one thread per logical CPU (for encrypt jobs)
-    unsigned nw = std::thread::hardware_concurrency();
-    if (nw < 1) nw = 4;
+    // Worker thread pool: DCC_WORKERS overrides; 0 → hardware_concurrency()
+    unsigned nw = (g_workers > 0)
+                  ? (unsigned)g_workers
+                  : std::thread::hardware_concurrency();
+    if (nw < 1) nw = 1;
     // Connection thread pool: fixed 64 threads replaces unbounded detach().
     // Conn threads are I/O-bound and short-lived (recv + queue + send), so 64
     // handles 100 concurrent connections without growing thread count unboundedly.
