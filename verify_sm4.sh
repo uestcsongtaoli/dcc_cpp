@@ -9,7 +9,7 @@
 #   --binary PATH    Path to dcc_encrypt binary (default: ./build/dcc_encrypt)
 #   --input  PATH    Input CSV path           (default: ./data/test_input.csv)
 #   --expected DIR   Expected outputs dir     (default: ./data/expected)
-#   --port   PORT    Server port              (default: 8080)
+#   --port   PORT    Server port              (default: 8081)
 #   --keep           Keep server running after test
 
 set -euo pipefail
@@ -18,7 +18,7 @@ set -euo pipefail
 BINARY="${BINARY:-./build/dcc_encrypt}"
 INPUT_CSV="${INPUT_CSV:-./data/test_input.csv}"
 EXPECTED_DIR="${EXPECTED_DIR:-./data/expected}"
-PORT="${PORT:-8080}"
+PORT="${PORT:-8081}"
 KEEP_SERVER=0
 
 while [[ $# -gt 0 ]]; do
