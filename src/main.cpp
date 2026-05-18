@@ -23,6 +23,7 @@
 #include <netdb.h>
 #include <unistd.h>
 #include <signal.h>
+#include <cpuid.h>
 #include "sm4.h"
 #include "sm4_avx512.h"
 
@@ -33,6 +34,7 @@ static std::string g_output_dir;
 static std::string g_team_code;
 static std::string g_callback_url;
 static bool        g_debug      = false;  // DCC_DEBUG=1 to enable
+static bool        g_hw_info    = false;  // DCC_HW_INFO=1 to enable
 
 // ─── Timing helpers ───────────────────────────────────────────────────────────
 
@@ -48,6 +50,10 @@ static inline double tms(TPoint a, TPoint b) {
 // TLOG: only emits when DCC_DEBUG=1; zero overhead in release mode
 #define TLOG(fmt, ...) \
     do { if (g_debug) { fprintf(stderr, "[T] " fmt "\n", ##__VA_ARGS__); } } while(0)
+
+// HWLOG: only emits when DCC_HW_INFO=1
+#define HWLOG(fmt, ...) \
+    do { if (g_hw_info) { fprintf(stderr, "[HW] " fmt "\n", ##__VA_ARGS__); } } while(0)
 
 // Fixed IV from baseline: "1234567890123456" as ASCII bytes
 static const uint8_t SM4_IV[16] = {
@@ -659,6 +665,216 @@ static void handle_conn(int fd) {
     if (fd >= 0) close(fd);
 }
 
+// ─── Hardware info dump (DCC_HW_INFO=1) ───────────────────────────────────────
+//
+// Uses CPUID leaves + /proc + /sys to collect:
+//   CPU identity, topology, cache sizes, AVX-512 feature bits, RAM, NUMA, freq.
+// All output lines are prefixed [HW] for easy grepping.
+
+static void print_hw_info() {
+    uint32_t eax, ebx, ecx, edx;
+
+    HWLOG("══════════════ Hardware Info ══════════════════════════════════");
+
+    // ── Vendor & max leaf ────────────────────────────────────────────────────
+    char vendor[13] = {};
+    __cpuid(0, eax, *(uint32_t*)&vendor[0], *(uint32_t*)&vendor[8], *(uint32_t*)&vendor[4]);
+    uint32_t max_leaf = eax;
+    HWLOG("Vendor: %-12s  max_leaf=0x%02x", vendor, max_leaf);
+
+    // ── CPU brand string (leaves 0x80000002–4) ────────────────────────────────
+    __cpuid(0x80000000, eax, ebx, ecx, edx);
+    if (eax >= 0x80000004u) {
+        char brand[49] = {};
+        __cpuid(0x80000002,
+                *(uint32_t*)&brand[ 0], *(uint32_t*)&brand[ 4],
+                *(uint32_t*)&brand[ 8], *(uint32_t*)&brand[12]);
+        __cpuid(0x80000003,
+                *(uint32_t*)&brand[16], *(uint32_t*)&brand[20],
+                *(uint32_t*)&brand[24], *(uint32_t*)&brand[28]);
+        __cpuid(0x80000004,
+                *(uint32_t*)&brand[32], *(uint32_t*)&brand[36],
+                *(uint32_t*)&brand[40], *(uint32_t*)&brand[44]);
+        const char* b = brand;
+        while (*b == ' ') ++b;
+        HWLOG("Brand:  %s", b);
+    }
+
+    // ── Family / Model / Stepping, max logical per package ───────────────────
+    __cpuid(1, eax, ebx, ecx, edx);
+    {
+        uint32_t stepping  =  eax        & 0xf;
+        uint32_t model     = (eax >>  4) & 0xf;
+        uint32_t family    = (eax >>  8) & 0xf;
+        uint32_t ext_model = (eax >> 16) & 0xf;
+        uint32_t ext_fam   = (eax >> 20) & 0xff;
+        uint32_t disp_fam  = (family == 0xf) ? family + ext_fam : family;
+        uint32_t disp_mod  = ((family == 0x6) || (family == 0xf))
+                             ? (ext_model << 4) | model : model;
+        uint32_t max_logical = (ebx >> 16) & 0xff;
+        HWLOG("Family=0x%02x  Model=0x%02x  Stepping=%u  LogicalPerPkg(CPUID1)=%u",
+              disp_fam, disp_mod, stepping, max_logical);
+    }
+
+    // ── Nominal / max / bus frequency (leaf 0x16, Skylake+) ─────────────────
+    if (max_leaf >= 0x16) {
+        __cpuid(0x16, eax, ebx, ecx, edx);
+        if (eax | ebx | ecx)
+            HWLOG("Freq (CPUID 0x16): base=%u MHz  max=%u MHz  bus=%u MHz",
+                  eax & 0xffff, ebx & 0xffff, ecx & 0xffff);
+    }
+
+    // ── Extended topology (leaf 0xB): SMT threads / core count ───────────────
+    if (max_leaf >= 0xb) {
+        HWLOG("Extended topology (CPUID 0xB):");
+        for (uint32_t sub = 0; sub < 4; ++sub) {
+            __cpuid_count(0xb, sub, eax, ebx, ecx, edx);
+            uint32_t level_type = (ecx >> 8) & 0xff;
+            if (level_type == 0) break;
+            uint32_t logical_at_level = ebx & 0xffff;
+            const char* lname = (level_type == 1) ? "SMT/thread"
+                               : (level_type == 2) ? "Core"
+                               : "Module";
+            HWLOG("  sub=%u  type=%-10s  logical_count=%u  x2APIC=%u",
+                  sub, lname, logical_at_level, edx);
+        }
+    }
+
+    // ── Cache topology (leaf 4) ───────────────────────────────────────────────
+    HWLOG("Cache topology (CPUID leaf 4):");
+    for (uint32_t sub = 0; ; ++sub) {
+        __cpuid_count(4, sub, eax, ebx, ecx, edx);
+        uint32_t type = eax & 0x1f;
+        if (type == 0) break;
+        uint32_t level    = (eax >>  5) & 0x7;
+        uint32_t sharing  = ((eax >> 14) & 0xfff) + 1;
+        uint32_t line_sz  =  (ebx        & 0xfff) + 1;
+        uint32_t parts    = ((ebx >> 12) & 0x3ff) + 1;
+        uint32_t ways     = ((ebx >> 22) & 0x3ff) + 1;
+        uint32_t sets     = ecx + 1;
+        uint32_t size_kb  = (uint32_t)((uint64_t)ways * parts * line_sz * sets / 1024);
+        uint32_t inclusive= (edx >> 1) & 1;
+        const char* tname = (type == 1) ? "Data    "
+                          : (type == 2) ? "Instr   "
+                          :               "Unified ";
+        HWLOG("  L%u-%s %6u KB  ways=%3u  sets=%5u  line=%2u B  parts=%u  shared=%2u  inclusive=%d",
+              level, tname, size_kb, ways, sets, line_sz, parts, sharing, inclusive);
+    }
+
+    // ── Feature flags: leaf 7, subleaf 0 ─────────────────────────────────────
+    if (max_leaf >= 7) {
+        __cpuid_count(7, 0, eax, ebx, ecx, edx);
+        // AVX-512 variants
+        HWLOG("AVX-512: F=%d  DQ=%d  BW=%d  VL=%d  CD=%d  IFMA=%d  VNNI=%d"
+              "  VBMI=%d  VBMI2=%d  BITALG=%d  VPOPCNTDQ=%d",
+              (ebx>>16)&1, (ebx>>17)&1, (ebx>>30)&1, (ebx>>31)&1,
+              (ebx>>28)&1, (ebx>>21)&1, (ecx>>11)&1,
+              (ecx>> 1)&1, (ecx>> 6)&1, (ecx>>12)&1, (ecx>>14)&1);
+        // Other useful flags
+        HWLOG("Other:   AVX2=%d  BMI1=%d  BMI2=%d  ERMS=%d  CLFLUSHOPT=%d  CLWB=%d  SHA=%d",
+              (ebx>> 5)&1, (ebx>> 3)&1, (ebx>> 8)&1, (ebx>> 9)&1,
+              (ebx>>23)&1, (ebx>>24)&1, (ebx>>29)&1);
+    }
+
+    // ── Leaf 1 feature bits ───────────────────────────────────────────────────
+    __cpuid(1, eax, ebx, ecx, edx);
+    HWLOG("Leaf1:   SSE4.1=%d  SSE4.2=%d  AVX=%d  AES=%d  PCLMUL=%d  POPCNT=%d  RDRAND=%d",
+          (ecx>>19)&1, (ecx>>20)&1, (ecx>>28)&1,
+          (ecx>>25)&1, (ecx>> 1)&1, (ecx>>23)&1, (ecx>>30)&1);
+
+    // ── /proc/cpuinfo: runtime MHz, physical cores ────────────────────────────
+    {
+        FILE* f = fopen("/proc/cpuinfo", "r");
+        if (f) {
+            char line[256];
+            double min_mhz = 1e9, max_mhz = 0;
+            int ncpu = 0, max_phys_id = -1, cores_per_socket = 0;
+            while (fgets(line, sizeof(line), f)) {
+                if (strncmp(line, "processor",  9) == 0) { ++ncpu; continue; }
+                if (strncmp(line, "cpu MHz",    7) == 0) {
+                    double mhz = atof(strchr(line, ':') + 1);
+                    if (mhz < min_mhz) min_mhz = mhz;
+                    if (mhz > max_mhz) max_mhz = mhz;
+                    continue;
+                }
+                if (strncmp(line, "physical id", 11) == 0) {
+                    int id = atoi(strchr(line, ':') + 1);
+                    if (id > max_phys_id) max_phys_id = id;
+                    continue;
+                }
+                if (strncmp(line, "cpu cores",  9) == 0) {
+                    cores_per_socket = atoi(strchr(line, ':') + 1);
+                    continue;
+                }
+            }
+            fclose(f);
+            HWLOG("/proc/cpuinfo: logical_cpus=%d  sockets=%d  cores_per_socket=%d"
+                  "  MHz min=%.0f max=%.0f",
+                  ncpu, max_phys_id + 1, cores_per_socket, min_mhz < 1e9 ? min_mhz : 0, max_mhz);
+        }
+    }
+
+    // ── /proc/meminfo ─────────────────────────────────────────────────────────
+    {
+        FILE* f = fopen("/proc/meminfo", "r");
+        if (f) {
+            char line[128];
+            while (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = '\0';
+                if (strncmp(line, "MemTotal:",       9) == 0 ||
+                    strncmp(line, "MemFree:",        8) == 0 ||
+                    strncmp(line, "HugePages_Total:",16) == 0 ||
+                    strncmp(line, "Hugepagesize:",   13) == 0)
+                    HWLOG("%s", line);
+            }
+            fclose(f);
+        }
+    }
+
+    // ── NUMA topology ─────────────────────────────────────────────────────────
+    {
+        FILE* f = fopen("/sys/devices/system/node/online", "r");
+        if (f) {
+            char line[64] = {};
+            if (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = '\0';
+                HWLOG("NUMA nodes online: %s", line);
+            }
+            fclose(f);
+        }
+    }
+
+    // ── Online CPUs ───────────────────────────────────────────────────────────
+    {
+        FILE* f = fopen("/sys/devices/system/cpu/online", "r");
+        if (f) {
+            char line[64] = {};
+            if (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = '\0';
+                HWLOG("CPUs online: %s", line);
+            }
+            fclose(f);
+        }
+    }
+
+    // ── CPU frequency governor ────────────────────────────────────────────────
+    {
+        FILE* f = fopen("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor", "r");
+        if (f) {
+            char line[64] = {};
+            if (fgets(line, sizeof(line), f)) {
+                line[strcspn(line, "\n")] = '\0';
+                HWLOG("CPU governor: %s", line);
+            }
+            fclose(f);
+        }
+    }
+
+    // ── hardware_concurrency (std::thread) ────────────────────────────────────
+    HWLOG("std::thread::hardware_concurrency = %u", std::thread::hardware_concurrency());
+    HWLOG("══════════════════════════════════════════════════════════════");
+}
+
 // ─── Main ─────────────────────────────────────────────────────────────────────
 
 int main() {
@@ -671,8 +887,11 @@ int main() {
     g_output_dir   = env("DCC_OUTPUT_DIR",  "/opt/app/dcc/baseline/output/");
     g_team_code    = env("DCC_TEAM_CODE",   "baseline");
     g_callback_url = env("DCC_CALLBACK_URL","http://dcc08-data-encrypt.paas.cmbchina.cn/callback");
-    g_debug        = (env("DCC_DEBUG", "0") == "1");
+    g_debug        = (env("DCC_DEBUG",   "0") == "1");
+    g_hw_info      = (env("DCC_HW_INFO", "0") == "1");
     g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));  // 0 = disable [BATCH] summary
+
+    if (g_hw_info) print_hw_info();
 
     if (!g_output_dir.empty() && g_output_dir.back() != '/')
         g_output_dir += '/';
