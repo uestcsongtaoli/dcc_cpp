@@ -13,7 +13,7 @@
 #   --keep           Keep server running after test
 
 set -euo pipefail
-
+export DCC_PORT=8081
 # ── Defaults ──────────────────────────────────────────────────────────────────
 BINARY="${BINARY:-./build/dcc_encrypt}"
 INPUT_CSV="${INPUT_CSV:-./data/test_input.csv}"
