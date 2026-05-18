@@ -33,7 +33,6 @@ static std::string g_output_dir;
 static std::string g_team_code;
 static std::string g_callback_url;
 static bool        g_debug      = false;  // DCC_DEBUG=1 to enable
-static bool        g_avx512_ok  = false;  // set at startup by cpu_has_avx512f()
 
 // ─── Timing helpers ───────────────────────────────────────────────────────────
 
@@ -513,12 +512,8 @@ static void do_encrypt(std::string requestId, std::string ip,
             ln += '\n';
         };
 
-        if (g_avx512_ok) {
-            // ── AVX-512 path: process 16 rows at a time ────────────────────
-            // For each SM4 field, gather 16 field values and encrypt them in
-            // parallel with sm4_cbc_encrypt_x16 (16 independent CBC chains,
-            // same key+IV, different plaintexts).  Mask fields use the
-            // precomputed g_masked_col lookup as before.
+        // ── AVX-512 path: process 16 rows at a time ────────────────────
+        {
             constexpr size_t B = 16;
             std::string lbufs[B];
             for (auto& lb : lbufs) lb.reserve(512);
@@ -577,14 +572,6 @@ static void do_encrypt(std::string requestId, std::string ip,
             std::string line;
             line.reserve(512);
             for (size_t row_idx = full; row_idx < nrows; ++row_idx) {
-                scalar_row(line, row_idx);
-                ofs.write(line.data(), line.size());
-            }
-        } else {
-            // ── Scalar path (no AVX-512) ───────────────────────────────────
-            std::string line;
-            line.reserve(512);
-            for (size_t row_idx = 0; row_idx < nrows; ++row_idx) {
                 scalar_row(line, row_idx);
                 ofs.write(line.data(), line.size());
             }
@@ -686,7 +673,6 @@ int main() {
     g_callback_url = env("DCC_CALLBACK_URL","http://dcc08-data-encrypt.paas.cmbchina.cn/callback");
     g_debug        = (env("DCC_DEBUG", "0") == "1");
     g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));  // 0 = disable [BATCH] summary
-    g_avx512_ok    = cpu_has_avx512f();
 
     if (!g_output_dir.empty() && g_output_dir.back() != '/')
         g_output_dir += '/';
@@ -701,7 +687,7 @@ int main() {
     // handles 100 concurrent connections without growing thread count unboundedly.
     unsigned nc = 64;
     std::cerr << "[INFO] Workers: " << nw << "  Conn pool: " << nc
-              << "  AVX-512: " << (g_avx512_ok ? "ON" : "OFF")
+              << "  AVX-512: ON"
               << "  CSV: " << g_csv_path
               << "  Out: " << g_output_dir << "\n";
     g_work_pool = new ThreadPool(nw);

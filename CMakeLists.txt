@@ -19,17 +19,10 @@ add_executable(dcc_encrypt
     src/sm4_avx512.cpp
 )
 
-# sm4_avx512.cpp must see __AVX512F__ so its intrinsics compile.
-# The #ifdef inside the file ensures graceful fallback on non-AVX-512 hosts.
-include(CheckCXXCompilerFlag)
-check_cxx_compiler_flag("-mavx512f" HAS_AVX512F)
-if(HAS_AVX512F)
-    set_source_files_properties(src/sm4_avx512.cpp PROPERTIES
-        COMPILE_FLAGS "-mavx512f")
-    message(STATUS "AVX-512F: available — sm4_avx512 compiled with -mavx512f")
-else()
-    message(STATUS "AVX-512F: not supported by compiler — sm4_avx512 uses scalar fallback")
-endif()
+# x86_64-only build: AVX-512F is always required.
+set_source_files_properties(src/sm4_avx512.cpp PROPERTIES
+    COMPILE_FLAGS "-mavx512f")
+message(STATUS "AVX-512F: enabled (-mavx512f)")
 
 target_include_directories(dcc_encrypt PRIVATE src)
 target_link_libraries(dcc_encrypt PRIVATE Threads::Threads)

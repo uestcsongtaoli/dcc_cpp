@@ -1,29 +1,6 @@
 #include "sm4_avx512.h"
-#include <cstring>
-
-// ─── Runtime CPU detection ────────────────────────────────────────────────────
-
-bool cpu_has_avx512f() {
-#if defined(__GNUC__) || defined(__clang__)
-    return __builtin_cpu_supports("avx512f");
-#else
-    return false;
-#endif
-}
-
-// ─── AVX-512 path ─────────────────────────────────────────────────────────────
-//
-// Strategy: process 16 independent SM4-CBC chains simultaneously.
-// Each ZMM register (512 bit) holds one 32-bit word from each of 16 parallel
-// blocks.  Four ZMM registers cover the full 4-word SM4 state.
-//
-// The T transform uses the precomputed T-box (TT[4][256]) via
-// _mm512_i32gather_epi32 — 4 gathers replace 4 scalar table-lookups, but now
-// handle 16 words at once instead of one.
-
-#ifdef __AVX512F__
-
 #include <immintrin.h>
+#include <cstring>
 
 // T-box tables built at startup by sm4.cpp (non-static there, extern here).
 extern uint32_t TT[4][256];
@@ -129,21 +106,3 @@ void sm4_cbc_encrypt_x16(
         }
     }
 }
-
-#else  // ── Scalar fallback (no AVX-512) ────────────────────────────────────
-
-void sm4_cbc_encrypt_x16(
-    const SM4Ctx&        ctx,
-    const uint8_t        iv[16],
-    const uint8_t* const pt[16],
-    const size_t         pt_len[16],
-    uint8_t* const       ct[16],
-    size_t               ct_len[16])
-{
-    for (int i = 0; i < 16; ++i) {
-        if (pt_len[i] == 0) { ct_len[i] = 0; continue; }
-        ct_len[i] = sm4_cbc_encrypt_into(ctx, iv, pt[i], pt_len[i], ct[i]);
-    }
-}
-
-#endif  // __AVX512F__
