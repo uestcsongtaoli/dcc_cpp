@@ -37,6 +37,7 @@ static std::string g_callback_url;
 static bool        g_debug      = false;  // DCC_DEBUG=1 to enable
 static bool        g_hw_info    = false;  // DCC_HW_INFO=1 to enable
 static bool        g_csv_stats  = false;  // DCC_CSV_STATS=1 to enable
+static int         g_port       = 8080;   // DCC_PORT=<n>
 
 // ─── Timing helpers ───────────────────────────────────────────────────────────
 
@@ -1035,6 +1036,7 @@ int main() {
     g_hw_info      = (env("DCC_HW_INFO",   "0") == "1");
     g_csv_stats    = (env("DCC_CSV_STATS", "0") == "1");
     g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));  // 0 = disable [BATCH] summary
+    g_port         = std::stoi(env("DCC_PORT",         "8080"));
 
     if (g_hw_info)   print_hw_info();
     if (g_csv_stats) ensure_csv();   // eager load → triggers analyze_csv_stats()
@@ -1065,14 +1067,14 @@ int main() {
 
     struct sockaddr_in addr{};
     addr.sin_family      = AF_INET;
-    addr.sin_port        = htons(8080);
+    addr.sin_port        = htons((uint16_t)g_port);
     addr.sin_addr.s_addr = INADDR_ANY;
 
     if (bind(srv, (sockaddr*)&addr, sizeof(addr)) < 0) {
         perror("bind"); return 1;
     }
     listen(srv, 512);
-    std::cerr << "[INFO] Listening on :8080\n";
+    std::cerr << "[INFO] Listening on :" << g_port << "\n";
 
     // Accept loop — submit to bounded pool instead of unbounded detach.
     // Also set per-connection recv/send timeouts so hung clients don't
