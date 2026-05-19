@@ -548,12 +548,14 @@ static void do_encrypt(std::string requestId, std::string ip,
                 throw std::runtime_error("Unknown field: " + f);
             finfos.push_back(it->second);
         }
+        auto t_fields = tnow();
+        TLOG("%-32s  fields=%6.3fms", requestId.c_str(), tms(t_init, t_fields));
 
         // ── 4. Prepare output path ─────────────────────────────────────────
         std::filesystem::create_directories(g_output_dir);
         std::string outpath = g_output_dir + requestId + ".csv";
         auto t_open = tnow();
-        TLOG("%-32s  file_open=%6.2fms", requestId.c_str(), tms(t_init, t_open));
+        TLOG("%-32s  dir=%6.3fms", requestId.c_str(), tms(t_fields, t_open));
 
         // ── 5. Encrypt rows ────────────────────────────────────────────────
         const size_t nrows = g_nrows;
@@ -581,6 +583,9 @@ static void do_encrypt(std::string requestId, std::string ip,
             ln += '\n';
         };
 
+        // Timing points inside the encrypt block (declared here, assigned inside).
+        TPoint t_alloc, t_avx, t_scalar;
+
         // ── AVX-512 path: process 16 rows at a time ────────────────────
         {
             constexpr size_t B = 16;
@@ -590,6 +595,8 @@ static void do_encrypt(std::string requestId, std::string ip,
             // field + comma + newline margin.
             std::string out_buf;
             out_buf.reserve(nrows * (finfos.size() * 66 + 2));
+            auto t_alloc = tnow();
+            TLOG("%-32s  alloc=%6.3fms", requestId.c_str(), tms(t_open, t_alloc));
 
             std::string lbufs[B];
             for (auto& lb : lbufs) lb.reserve(512);
@@ -639,6 +646,8 @@ static void do_encrypt(std::string requestId, std::string ip,
                     out_buf.append(lbufs[b]);
                 }
             }
+            auto t_avx = tnow();
+            TLOG("%-32s  avx=%7.2fms  full_rows=%zu", requestId.c_str(), tms(t_alloc, t_avx), full);
 
             // Scalar remainder for the last (nrows % 16) rows.
             std::string line;
@@ -647,6 +656,8 @@ static void do_encrypt(std::string requestId, std::string ip,
                 scalar_row(line, row_idx);
                 out_buf.append(line);
             }
+            auto t_scalar = tnow();
+            TLOG("%-32s  rem=%7.3fms  rem_rows=%zu", requestId.c_str(), tms(t_avx, t_scalar), nrows - full);
 
             // ── 6. Single write ────────────────────────────────────────────
             // One fwrite call instead of 300k ofs.write() calls.
@@ -656,13 +667,8 @@ static void do_encrypt(std::string requestId, std::string ip,
             fclose(fp);
         }
         auto t_encrypt = tnow();
-        TLOG("%-32s  encrypt=%7.1fms  rows=%zu  fields=%zu",
-             requestId.c_str(), tms(t_open, t_encrypt),
-             nrows, finfos.size());
-
-        // flush is now part of the single fwrite/fclose above
-        auto t_close = t_encrypt;
-        TLOG("%-32s  flush=%6.2fms", requestId.c_str(), tms(t_encrypt, t_close));
+        TLOG("%-32s  wr=%7.3fms  bytes=%zu",
+             requestId.c_str(), tms(t_scalar, t_encrypt), nrows * (finfos.size() * 66 + 2));
 
         // ── 7. Callback ────────────────────────────────────────────────────
         if (!g_callback_url.empty() && g_callback_url != "skip") {
@@ -676,25 +682,36 @@ static void do_encrypt(std::string requestId, std::string ip,
             }
         }
         auto t_cb = tnow();
-        TLOG("%-32s  callback=%6.1fms", requestId.c_str(), tms(t_close, t_cb));
+        TLOG("%-32s  callback=%6.1fms", requestId.c_str(), tms(t_encrypt, t_cb));
 
         // ── Summary (always printed) ───────────────────────────────────────
-        double d_total   = tms(t_start, t_cb);
-        double d_encrypt = tms(t_open, t_encrypt);
-        double d_cb      = tms(t_close, t_cb);
-        double d_wall    = batch_wall_ms();   // elapsed since first request arrived
+        double d_total   = tms(t_start,  t_cb);
+        double d_csv     = tms(t_start,  t_csv);
+        double d_key     = tms(t_csv,    t_init);
+        double d_fields  = tms(t_init,   t_fields);
+        double d_dir     = tms(t_fields, t_open);
+        double d_alloc   = tms(t_open,   t_alloc);
+        double d_avx     = tms(t_alloc,  t_avx);
+        double d_scalar  = tms(t_avx,    t_scalar);
+        double d_wr      = tms(t_scalar, t_encrypt);
+        double d_cb      = tms(t_encrypt, t_cb);
+        double d_enc     = tms(t_open,   t_encrypt);  // alloc+avx+rem+wr combined
+        double d_wall    = batch_wall_ms();
         int    done      = g_req_done.load() + 1;  // +1: will be incremented below
         int    submitted = g_req_submitted.load();
 
         fprintf(stderr,
-            "[DONE] %-28s [%3d/%-3d]  req=%7.0fms  wall=%7.0fms"
-            "  (csv=%5.1f  init=%.2f  enc=%6.0f  wr=%4.1f  cb=%5.0f)\n",
+            "[DONE] %-28s [%3d/%-3d]  req=%7.1fms  wall=%7.1fms"
+            "  csv=%5.1f  key=%.2f  fld=%.2f  dir=%.2f"
+            "  alloc=%5.2f  avx=%6.1f  rem=%5.2f  wr=%5.2f  cb=%5.1f"
+            "  enc=%6.1f\n",
             requestId.c_str(), done, submitted,
             d_total, d_wall,
-            tms(t_start, t_csv), tms(t_csv, t_init),
-            d_encrypt, tms(t_encrypt, t_close), d_cb);
+            d_csv, d_key, d_fields, d_dir,
+            d_alloc, d_avx, d_scalar, d_wr, d_cb,
+            d_enc);
 
-        batch_req_done(d_total, d_encrypt, d_cb);  // increments g_req_done, triggers [BATCH]
+        batch_req_done(d_total, d_enc, d_cb);  // increments g_req_done, triggers [BATCH]
 
     } catch (const std::exception& e) {
         fprintf(stderr, "[ERROR] %s: %s  elapsed=%.1fms\n",
