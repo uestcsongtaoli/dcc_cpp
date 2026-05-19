@@ -598,8 +598,10 @@ static void do_encrypt(std::string requestId, std::string ip,
             auto t_alloc = tnow();
             TLOG("%-32s  alloc=%6.3fms", requestId.c_str(), tms(t_open, t_alloc));
 
-            std::string lbufs[B];
-            for (auto& lb : lbufs) lb.reserve(512);
+            // write_ptr[b] tracks current write position for each row directly
+            // inside out_buf — no intermediate lbufs copy needed.
+            size_t row_sizes[B];
+            char*  write_ptr[B];
 
             const uint8_t* pt_p[B];
             size_t         pt_l[B];
@@ -611,39 +613,63 @@ static void do_encrypt(std::string requestId, std::string ip,
             const size_t full = (nrows / B) * B;
 
             for (size_t base = 0; base < full; base += B) {
-                for (size_t b = 0; b < B; ++b) lbufs[b].clear();
+                // ── phase 1: compute exact output byte count per row ─────────
+                for (size_t b = 0; b < B; ++b) row_sizes[b] = 1; // newline
+                for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
+                    const auto& fi = finfos[fi_i];
+                    size_t comma = (fi_i > 0) ? 1 : 0;
+                    if (fi.is_sm4) {
+                        for (size_t b = 0; b < B; ++b) {
+                            size_t plen = g_cols[fi.col][base + b].size();
+                            row_sizes[b] += comma + (plen > 0 ? ((plen / 16) + 1) * 32 : 0);
+                        }
+                    } else {
+                        int midx = fi.col - 4;
+                        for (size_t b = 0; b < B; ++b)
+                            row_sizes[b] += comma + g_masked_col[midx][base + b].size();
+                    }
+                }
 
+                // ── phase 2: extend out_buf once, assign per-row pointers ────
+                {
+                    size_t batch_total = 0;
+                    for (size_t b = 0; b < B; ++b) batch_total += row_sizes[b];
+                    size_t batch_start = out_buf.size();
+                    out_buf.resize(batch_start + batch_total);
+                    char* p = out_buf.data() + batch_start;
+                    for (size_t b = 0; b < B; ++b) {
+                        write_ptr[b] = p;
+                        p[row_sizes[b] - 1] = '\n'; // stamp newline at row end
+                        p += row_sizes[b];
+                    }
+                }
+
+                // ── phase 3: fill fields column-major (SM4 still x16) ────────
                 for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
                     const auto& fi = finfos[fi_i];
                     if (fi.is_sm4) {
-                        // Gather 16 plaintexts from the same column (sequential
-                        // in g_cols[col], cache-friendly with hardware prefetcher).
+                        // Gather 16 plaintexts from the same column.
                         for (size_t b = 0; b < B; ++b) {
                             const std::string& val = g_cols[fi.col][base + b];
                             pt_p[b] = (const uint8_t*)val.data();
                             pt_l[b] = val.size();
                         }
                         sm4_cbc_encrypt_x16(ctx, SM4_IV, pt_p, pt_l, ct_p, ct_l);
-                        // Hex-encode into per-row line buffers (AVX2).
                         for (size_t b = 0; b < B; ++b) {
-                            if (fi_i > 0) lbufs[b] += ',';
+                            if (fi_i > 0) *write_ptr[b]++ = ',';
                             if (ct_l[b] == 0) continue;
-                            size_t s = lbufs[b].size();
-                            lbufs[b].resize(s + ct_l[b] * 2);
-                            hex_encode(ct_s[b], lbufs[b].data() + s, ct_l[b]);
+                            hex_encode(ct_s[b], write_ptr[b], ct_l[b]);
+                            write_ptr[b] += ct_l[b] * 2;
                         }
                     } else {
-                        // Precomputed mask lookup — zero compute, zero alloc.
+                        int midx = fi.col - 4;
                         for (size_t b = 0; b < B; ++b) {
-                            if (fi_i > 0) lbufs[b] += ',';
-                            lbufs[b] += g_masked_col[fi.col - 4][base + b];
+                            if (fi_i > 0) *write_ptr[b]++ = ',';
+                            const std::string& m = g_masked_col[midx][base + b];
+                            memcpy(write_ptr[b], m.data(), m.size());
+                            write_ptr[b] += m.size();
                         }
                     }
-                }
-
-                for (size_t b = 0; b < B; ++b) {
-                    lbufs[b] += '\n';
-                    out_buf.append(lbufs[b]);
                 }
             }
             auto t_avx = tnow();
