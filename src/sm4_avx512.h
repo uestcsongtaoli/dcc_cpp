@@ -26,3 +26,13 @@ void sm4_cbc_encrypt_x16_nopad(
     const uint8_t* const pt[16],
     const size_t         ct_len[16],
     uint8_t* const       ct[16]);
+
+// Like x16_nopad but processes 32 chains at once.
+// Chains 0..15 form batch A, chains 16..31 form batch B; both encrypted
+// through sm4_ecb_x32 which doubles in-flight gathers to hide latency.
+void sm4_cbc_encrypt_x32_nopad(
+    const SM4Ctx&        ctx,
+    const uint8_t        iv[16],
+    const uint8_t* const pt[32],
+    const size_t         ct_len[32],
+    uint8_t* const       ct[32]);

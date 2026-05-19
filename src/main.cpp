@@ -521,7 +521,7 @@ static void submit_and_wait(size_t count, std::function<void(size_t)> fn) {
 static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
     if (row_start >= row_end) return;
 
-    constexpr size_t B = 16;
+    constexpr size_t B = 32;
     char* base = req->out_buf.data();
 
     // Ciphertext staging (stack): max 4 SM4 blocks = 64 bytes per chain
@@ -551,7 +551,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
                     pt_p[b] = spf.blob.data() + spf.offset[r];
                     ct_l[b] = spf.padlen[r];
                 }
-                sm4_cbc_encrypt_x16_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+                sm4_cbc_encrypt_x32_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
                 for (size_t b = 0; b < B; b++) {
                     if (ct_l[b] == 0) continue;
                     hex_encode(ct_s[b], wp[b], ct_l[b]);
