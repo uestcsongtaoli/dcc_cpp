@@ -599,11 +599,15 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 
 // ─── Batch processor ──────────────────────────────────────────────────────────
 //
-// Called ONCE per batch from a conn-pool thread (never g_work_pool).
+// Processes the collected batch in mini-batches of MINI requests at a time.
 //
-// Phase 1: parallel pre-computation of row_offset[] + out_buf allocation.
-// Phase 2: encrypt+mask all rows, chunk-first task ordering for L3 cache reuse.
-// Phase 3: write output files + callbacks.
+// Memory budget analysis (300K rows, 7 fields max, 112 MB out_buf/request):
+//   Old (all 100 at once): 100 × 112 MB = 11.2 GB  → exceeds 8 GB constraint
+//   New (MINI=16 at once): 16  × 112 MB =  1.8 GB  → safe on 7.6 GB machine
+//
+// Each mini-batch runs the full pipeline (alloc → encrypt → write+callback)
+// and frees out_buf immediately after the file is written, before moving on.
+// Chunk-first task ordering within each mini-batch preserves L3 cache reuse.
 
 static void process_batch(std::vector<BatchReq*> batch) {
     if (batch.empty()) return;
@@ -611,104 +615,102 @@ static void process_batch(std::vector<BatchReq*> batch) {
     ensure_csv();
     const size_t nrows = g_nrows;
 
-    // ── Phase 1: row offsets + output buffer allocation ───────────────────────
-    submit_and_wait(batch.size(), [&](size_t i) {
-        BatchReq* req = batch[i];
-        req->row_offset.resize(nrows + 1);
-        uint32_t off = 0;
-        for (size_t r = 0; r < nrows; r++) {
-            req->row_offset[r] = off;
-            uint32_t rsz = 1; // newline
-            for (int fi = 0; fi < req->nfields; fi++) {
-                if (fi > 0) rsz++;
-                if (req->is_sm4[fi])
-                    rsz += (uint32_t)g_sm4_pad[req->sm4idx[fi]].padlen[r] * 2u;
-                else
-                    rsz += g_mask_outlen[req->maskidx[fi]][r];
-            }
-            off += rsz;
-        }
-        req->row_offset[nrows] = off;
-        req->out_buf.resize(off);
-    });
-    auto t_alloc = tnow();
+    std::filesystem::create_directories(g_output_dir);
 
-    // ── Phase 2: encrypt + mask, chunk-first task order ───────────────────────
-    //
-    // Chunk-first order: all 100 tasks for chunk 0 are submitted before chunk 1.
-    // Workers processing the same row range across different requests share the
-    // same column slice in L3 cache → avoids redundant cache-line loads.
-    //
-    // CHUNK_SIZE = 8192: one request's working set per task ≈
-    //   8192 rows × avg 3.5 SM4 fields × 16 bytes/padlen ≈ 458 KB → L2/L3 warm.
-
-    constexpr size_t CHUNK_SIZE = 8192;
+    constexpr size_t MINI       = 16;    // requests per mini-batch
+    constexpr size_t CHUNK_SIZE = 8192;  // rows per compute task
     const size_t n_chunks = (nrows + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
     struct CTask { BatchReq* req; size_t rs, re; };
-    std::vector<CTask> ctasks;
-    ctasks.reserve(n_chunks * batch.size());
-    for (size_t chunk = 0; chunk < n_chunks; chunk++) {
-        size_t rs = chunk * CHUNK_SIZE;
-        size_t re = std::min(rs + CHUNK_SIZE, nrows);
-        for (auto* req : batch)
-            ctasks.push_back({req, rs, re});
-    }
-    submit_and_wait(ctasks.size(), [&](size_t i) {
-        compute_rows(ctasks[i].req, ctasks[i].rs, ctasks[i].re);
-    });
-    auto t_compute = tnow();
 
-    // ── Phase 3: write files + callbacks ─────────────────────────────────────
-    std::filesystem::create_directories(g_output_dir);
+    for (size_t mb_start = 0; mb_start < batch.size(); mb_start += MINI) {
+        size_t     mb_end = std::min(mb_start + MINI, batch.size());
+        size_t     mb_sz  = mb_end - mb_start;
+        BatchReq** mb     = batch.data() + mb_start;
+        auto t_mb = tnow();
 
-    submit_and_wait(batch.size(), [&](size_t i) {
-        BatchReq* req = batch[i];
-        auto t_enc_end = tnow();
-
-        FILE* fp = fopen(req->out_path.c_str(), "wb");
-        if (fp) {
-            fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
-            fclose(fp);
-        }
-        auto t_wr = tnow();
-
-        double cb_ms = 0.0;
-        if (!g_callback_url.empty() && g_callback_url != "skip") {
-            auto t_cb0 = tnow();
-            std::string cb =
-                "{\"teamCode\":\"" + g_team_code + "\","
-                "\"requestId\":\"" + req->request_id + "\","
-                "\"ip\":\"" + req->ip + "\"}";
-            for (int retry = 0; retry < 5; retry++) {
-                if (http_post(g_callback_url, cb)) break;
-                usleep(50000);
+        // ── Phase 1: row offsets + output buffer allocation ───────────────────
+        submit_and_wait(mb_sz, [&](size_t i) {
+            BatchReq* req = mb[i];
+            req->row_offset.resize(nrows + 1);
+            uint32_t off = 0;
+            for (size_t r = 0; r < nrows; r++) {
+                req->row_offset[r] = off;
+                uint32_t rsz = 1; // newline
+                for (int fi = 0; fi < req->nfields; fi++) {
+                    if (fi > 0) rsz++;
+                    if (req->is_sm4[fi])
+                        rsz += (uint32_t)g_sm4_pad[req->sm4idx[fi]].padlen[r] * 2u;
+                    else
+                        rsz += g_mask_outlen[req->maskidx[fi]][r];
+                }
+                off += rsz;
             }
-            cb_ms = tms(t_cb0, tnow());
+            req->row_offset[nrows] = off;
+            req->out_buf.resize(off);
+        });
+
+        // ── Phase 2: encrypt + mask, chunk-first task order ──────────────────
+        std::vector<CTask> ctasks;
+        ctasks.reserve(n_chunks * mb_sz);
+        for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+            size_t rs = chunk * CHUNK_SIZE;
+            size_t re = std::min(rs + CHUNK_SIZE, nrows);
+            for (size_t i = 0; i < mb_sz; i++)
+                ctasks.push_back({mb[i], rs, re});
         }
+        submit_and_wait(ctasks.size(), [&](size_t i) {
+            compute_rows(ctasks[i].req, ctasks[i].rs, ctasks[i].re);
+        });
+        auto t_mb_compute = tnow();
 
-        double d_total = tms(req->t_req_start, tnow());
-        double d_enc   = tms(t_batch, t_compute);  // shared batch compute time
-        double d_wr    = tms(t_enc_end, t_wr);
-        double d_wall  = batch_wall_ms();
-        int    done    = g_req_done.load() + 1;
-        int    subm    = g_req_submitted.load();
+        // ── Phase 3: write files + callbacks, free out_buf immediately ────────
+        submit_and_wait(mb_sz, [&](size_t i) {
+            BatchReq* req = mb[i];
 
-        fprintf(stderr,
-            "[DONE] %-28s [%3d/%-3d]  req=%7.1fms  wall=%7.1fms"
-            "  enc=%6.1f  wr=%5.2f  cb=%5.1f\n",
-            req->request_id.c_str(), done, subm,
-            d_total, d_wall, d_enc, d_wr, cb_ms);
+            FILE* fp = fopen(req->out_path.c_str(), "wb");
+            if (fp) {
+                fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
+                fclose(fp);
+            }
+            // Release output buffer now — don't wait until batch end
+            std::string().swap(req->out_buf);
+            std::vector<uint32_t>().swap(req->row_offset);
 
-        batch_req_done(d_total, d_enc, cb_ms);
-    });
+            double cb_ms = 0.0;
+            if (!g_callback_url.empty() && g_callback_url != "skip") {
+                auto t_cb0 = tnow();
+                std::string cb =
+                    "{\"teamCode\":\"" + g_team_code + "\","
+                    "\"requestId\":\"" + req->request_id + "\","
+                    "\"ip\":\"" + req->ip + "\"}";
+                for (int retry = 0; retry < 5; retry++) {
+                    if (http_post(g_callback_url, cb)) break;
+                    usleep(50000);
+                }
+                cb_ms = tms(t_cb0, tnow());
+            }
+
+            double d_total = tms(req->t_req_start, tnow());
+            double d_enc   = tms(t_mb, t_mb_compute);
+            double d_wall  = batch_wall_ms();
+            int    done    = g_req_done.load() + 1;
+            int    subm    = g_req_submitted.load();
+
+            fprintf(stderr,
+                "[DONE] %-28s [%3d/%-3d]  req=%7.1fms  wall=%7.1fms"
+                "  enc=%6.1f  cb=%5.1f\n",
+                req->request_id.c_str(), done, subm,
+                d_total, d_wall, d_enc, cb_ms);
+
+            batch_req_done(d_total, d_enc, cb_ms);
+        });
+    }
 
     auto t_end = tnow();
     fprintf(stderr,
-        "[BATCH_PHASES] n=%zu  alloc=%.1fms  compute=%.1fms  output=%.1fms  total=%.1fms\n",
-        batch.size(),
-        tms(t_batch, t_alloc), tms(t_alloc, t_compute),
-        tms(t_compute, t_end), tms(t_batch, t_end));
+        "[BATCH_PHASES] n=%zu  total=%.1fms\n",
+        batch.size(), tms(t_batch, t_end));
 
     for (auto* req : batch) delete req;
 }
