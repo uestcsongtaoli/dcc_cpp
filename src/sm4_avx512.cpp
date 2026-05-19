@@ -43,6 +43,53 @@ static void sm4_ecb_x16(const SM4Ctx& ctx, __m512i st[4]) {
     st[0]=X3; st[1]=X2; st[2]=X1; st[3]=X0;
 }
 
+// ── nopad variant ─────────────────────────────────────────────────────────────
+// Inputs are already PKCS7-padded.  Reads directly from pt[i] — no staging copy.
+// ct_len[i] must be a multiple of 16.
+void sm4_cbc_encrypt_x16_nopad(
+    const SM4Ctx&        ctx,
+    const uint8_t        iv[16],
+    const uint8_t* const pt[16],
+    const size_t         ct_len[16],
+    uint8_t* const       ct[16])
+{
+    size_t max_total = 0;
+    for (int i = 0; i < 16; ++i)
+        if (ct_len[i] > max_total) max_total = ct_len[i];
+    if (max_total == 0) return;
+
+    uint32_t iv_w[4];
+    for (int j = 0; j < 4; ++j) iv_w[j] = load_be32(iv + j*4);
+
+    alignas(64) uint32_t prev[4][16];
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 16; ++i)
+            prev[j][i] = iv_w[j];
+
+    alignas(64) uint32_t col[16];
+    alignas(64) uint32_t ct_col[16];
+    for (size_t off = 0; off < max_total; off += 16) {
+        __m512i st[4];
+        for (int j = 0; j < 4; ++j) {
+            for (int i = 0; i < 16; ++i) {
+                uint32_t pt_w = (off < ct_len[i]) ? load_be32(pt[i] + off + j*4) : 0u;
+                col[i] = pt_w ^ prev[j][i];
+            }
+            st[j] = _mm512_load_si512((const __m512i*)col);
+        }
+        sm4_ecb_x16(ctx, st);
+        for (int j = 0; j < 4; ++j) {
+            _mm512_store_si512((__m512i*)ct_col, st[j]);
+            for (int i = 0; i < 16; ++i) {
+                prev[j][i] = ct_col[i];
+                if (off < ct_len[i])
+                    store_be32(ct[i] + off + j*4, ct_col[i]);
+            }
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 void sm4_cbc_encrypt_x16(
     const SM4Ctx&        ctx,
     const uint8_t        iv[16],

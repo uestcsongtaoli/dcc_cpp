@@ -16,3 +16,13 @@ void sm4_cbc_encrypt_x16(
     const size_t         pt_len[16],
     uint8_t* const       ct[16],
     size_t               ct_len[16]);
+
+// Like sm4_cbc_encrypt_x16 but inputs are already PKCS7-padded.
+// pt[i] points to ct_len[i] bytes (must be a multiple of 16).
+// Reads pt[i] directly — no staging-buffer copy, no re-padding.
+void sm4_cbc_encrypt_x16_nopad(
+    const SM4Ctx&        ctx,
+    const uint8_t        iv[16],
+    const uint8_t* const pt[16],
+    const size_t         ct_len[16],
+    uint8_t* const       ct[16]);

@@ -27,32 +27,28 @@
 #include "sm4.h"
 #include "sm4_avx512.h"
 
-// ─── Config (set via env vars) ────────────────────────────────────────────────
+// ─── Config ───────────────────────────────────────────────────────────────────
 
 static std::string g_csv_path;
 static std::string g_output_dir;
 static std::string g_team_code;
 static std::string g_callback_url;
-static bool        g_debug      = false;  // DCC_DEBUG=1 to enable
-static int         g_port       = 8080;   // DCC_PORT=<n>
-static int         g_workers    = 0;      // DCC_WORKERS=<n>  0 = hardware_concurrency()
+static bool        g_debug      = false;
+static int         g_port       = 8080;
+static int         g_workers    = 0;
+static int         g_expect_reqs= 100;
 
-// ─── Timing helpers ───────────────────────────────────────────────────────────
+// ─── Timing ───────────────────────────────────────────────────────────────────
 
 using TClock = std::chrono::steady_clock;
 using TPoint = TClock::time_point;
-
 static inline TPoint tnow() { return TClock::now(); }
-
 static inline double tms(TPoint a, TPoint b) {
     return std::chrono::duration<double, std::milli>(b - a).count();
 }
-
-// TLOG: only emits when DCC_DEBUG=1; zero overhead in release mode
 #define TLOG(fmt, ...) \
     do { if (g_debug) { fprintf(stderr, "[T] " fmt "\n", ##__VA_ARGS__); } } while(0)
 
-// Fixed IV from baseline: "1234567890123456" as ASCII bytes
 static const uint8_t SM4_IV[16] = {
     '1','2','3','4','5','6','7','8','9','0','1','2','3','4','5','6'
 };
@@ -75,27 +71,33 @@ static const std::unordered_map<std::string, FieldInfo> FIELDS = {
     {"secret_code",  {10, true}},
 };
 
-// ─── CSV data cache (column-oriented) ────────────────────────────────────────
-//
-// g_cols[col][row]: one vector<string> per field column.
-// Sequential access within a batch (rows base..base+15 of the SAME column) is
-// contiguous in memory → hardware prefetcher friendly, no double-pointer chase.
+// col → SM4 field index (0-6); -1 for mask fields
+static const int COL_TO_SM4IDX[11] = {0, 1, 2, 3, -1, -1, -1, -1, 4, 5, 6};
+// SM4 field index (0-6) → column index
+static const int SM4IDX_TO_COL[7]  = {0, 1, 2, 3, 8, 9, 10};
 
-static std::vector<std::string> g_cols[11];   // g_cols[col][row]
+// ─── CSV data ─────────────────────────────────────────────────────────────────
+
+static std::vector<std::string> g_cols[11];
 static size_t                   g_nrows = 0;
 static std::atomic<bool> g_csv_ready{false};
 static std::mutex g_csv_mu;
 
-// Permanent empty string — avoids dangling reference to temporaries.
-static const std::string g_empty_str;
-
-// Precomputed mask results for the 4 mask columns (computed once at CSV load).
-// Index mapping: id_card(col4)→0, phone(col5)→1, name(col6)→2, email(col7)→3
-// All 100 concurrent requests read this read-only data without any locking.
+// Precomputed mask output (col4-7 → idx0-3)
 static std::vector<std::string> g_masked_col[4];
+static std::vector<uint16_t>    g_mask_outlen[4];  // byte length of each masked value
 
-static std::string mask(const std::string& s);  // forward decl; defined below
+// Pre-computed PKCS7-padded plaintext blobs for the 7 SM4 fields.
+// Sequential memory instead of scattered std::string heap pointers →
+// hardware prefetcher friendly, avoids per-request memcpy+memset.
+struct SM4PaddedField {
+    std::vector<uint32_t> offset;  // byte offset in blob for row r
+    std::vector<uint16_t> padlen;  // PKCS7 padded length for row r (multiple of 16)
+    std::vector<uint8_t>  blob;    // concatenated PKCS7-padded plaintexts
+};
+static SM4PaddedField g_sm4_pad[7];
 
+static std::string mask(const std::string& s);  // forward decl
 
 static void load_csv() {
     auto t0 = tnow();
@@ -110,9 +112,6 @@ static void load_csv() {
     auto t1 = tnow();
     while (std::getline(ifs, line)) {
         if (line.empty()) continue;
-        // Parse directly into per-column vectors — no intermediate row object.
-        // Trailing \r stripped once per line; field data stays on the stack
-        // until emplace_back moves it into the column vector.
         const char* p   = line.c_str();
         const char* end = p + line.size();
         if (end > p && *(end - 1) == '\r') --end;
@@ -122,29 +121,54 @@ static void load_csv() {
             while (p < end && *p != ',') ++p;
             g_cols[col].emplace_back(fs, (size_t)(p - fs));
             ++col;
-            if (p < end) ++p;  // skip comma
+            if (p < end) ++p;
         }
-        // If line had fewer than 11 fields, fill with empty strings.
         while (col < 11) { g_cols[col].emplace_back(); ++col; }
     }
     g_nrows = g_cols[0].size();
     auto t2 = tnow();
 
-    // Precompute mask() for all 4 mask columns.
-    // id_card=col4→idx0, phone=col5→idx1, name=col6→idx2, email=col7→idx3
+    // Precompute mask for 4 mask columns (col4-7 → idx0-3)
     for (int m = 0; m < 4; m++) {
         int col = m + 4;
         g_masked_col[m].reserve(g_nrows);
-        for (size_t r = 0; r < g_nrows; ++r)
+        g_mask_outlen[m].resize(g_nrows);
+        for (size_t r = 0; r < g_nrows; ++r) {
             g_masked_col[m].push_back(mask(g_cols[col][r]));
+            g_mask_outlen[m][r] = (uint16_t)g_masked_col[m][r].size();
+        }
     }
     auto t3 = tnow();
 
+    // Pre-compute PKCS7-padded plaintext blobs for 7 SM4 fields.
+    for (int f = 0; f < 7; f++) {
+        int col = SM4IDX_TO_COL[f];
+        g_sm4_pad[f].offset.resize(g_nrows);
+        g_sm4_pad[f].padlen.resize(g_nrows);
+        uint32_t total = 0;
+        for (size_t r = 0; r < g_nrows; r++) {
+            g_sm4_pad[f].offset[r] = total;
+            size_t plen = g_cols[col][r].size();
+            auto   pad  = (uint16_t)(16 - (plen & 15u));
+            auto   padded = (uint16_t)(plen + pad);
+            g_sm4_pad[f].padlen[r] = padded;
+            total += padded;
+        }
+        g_sm4_pad[f].blob.resize(total);
+        for (size_t r = 0; r < g_nrows; r++) {
+            size_t  plen = g_cols[col][r].size();
+            uint8_t pad  = (uint8_t)(g_sm4_pad[f].padlen[r] - (uint16_t)plen);
+            uint8_t* dst = g_sm4_pad[f].blob.data() + g_sm4_pad[f].offset[r];
+            memcpy(dst, g_cols[col][r].data(), plen);
+            memset(dst + plen, pad, pad);
+        }
+    }
+    auto t4 = tnow();
+
     fprintf(stderr,
         "[INFO] CSV loaded: %zu rows"
-        " | open=%.1fms  parse=%.1fms  mask_pre=%.1fms  total=%.1fms\n",
-        g_nrows, tms(t0, t1), tms(t1, t2), tms(t2, t3), tms(t0, t3));
-
+        " | open=%.1fms  parse=%.1fms  mask_pre=%.1fms  pad_pre=%.1fms  total=%.1fms\n",
+        g_nrows, tms(t0, t1), tms(t1, t2), tms(t2, t3), tms(t3, t4), tms(t0, t4));
 }
 
 static void ensure_csv() {
@@ -156,13 +180,9 @@ static void ensure_csv() {
 }
 
 // ─── Mask ─────────────────────────────────────────────────────────────────────
-// Java uses UTF-16 length() which equals Unicode code points for BMP chars
-// (covers all common CJK). We count UTF-8 code points same way.
 
 static std::string mask(const std::string& s) {
     if (s.empty()) return s;
-
-    // Collect byte offset of each Unicode code point
     std::vector<size_t> cp_starts;
     cp_starts.reserve(s.size());
     for (size_t i = 0; i < s.size(); ) {
@@ -174,27 +194,22 @@ static std::string mask(const std::string& s) {
         else                          i += 4;
     }
     size_t n = cp_starts.size();
-
-    // first char: bytes [cp_starts[0], cp_starts[1])
     size_t first_end = (n > 1) ? cp_starts[1] : s.size();
     std::string first(s, 0, first_end);
-
-    if (n <= 6) {
+    if (n <= 6)
         return first + "#####";
-    } else {
-        std::string last(s, cp_starts[n - 1]);
-        return first + "####" + last;
-    }
+    std::string last(s, cp_starts[n - 1]);
+    return first + "####" + last;
 }
 
 // ─── Thread pool ──────────────────────────────────────────────────────────────
 
 class ThreadPool {
-    std::vector<std::thread> workers_;
+    std::vector<std::thread>        workers_;
     std::queue<std::function<void()>> q_;
-    std::mutex mu_;
-    std::condition_variable cv_;
-    bool stop_ = false;
+    std::mutex                      mu_;
+    std::condition_variable         cv_;
+    bool                            stop_ = false;
 public:
     explicit ThreadPool(size_t n) {
         for (size_t i = 0; i < n; i++) {
@@ -226,21 +241,17 @@ public:
 static ThreadPool* g_work_pool = nullptr;
 static ThreadPool* g_conn_pool = nullptr;
 
-// ─── Batch timing & aggregate stats ──────────────────────────────────────────
+// ─── Batch timing ─────────────────────────────────────────────────────────────
 
-static int                g_expect_reqs = 100;   // DCC_EXPECT_REQS (0 = disable summary)
+static std::mutex         g_batch_mu;
+static TPoint             g_t_batch_start;
+static std::atomic<bool>  g_t_batch_set{false};
 static std::atomic<int>   g_req_submitted{0};
 static std::atomic<int>   g_req_done{0};
 
-static std::mutex         g_batch_mu;
-static TPoint             g_t_batch_start;        // time first /encrypt was received
-static std::atomic<bool>  g_t_batch_set{false};
-
 struct ReqStat { double total_ms, encrypt_ms, cb_ms; };
-static std::vector<ReqStat> g_req_stats;          // guarded by g_batch_mu
+static std::vector<ReqStat> g_req_stats;
 
-// Record the start of the batch (first /encrypt call).
-// Double-checked locking — same pattern as ensure_csv().
 static void batch_mark_start() {
     if (g_t_batch_set.load(std::memory_order_acquire)) return;
     std::lock_guard<std::mutex> lk(g_batch_mu);
@@ -249,15 +260,10 @@ static void batch_mark_start() {
         g_t_batch_set.store(true, std::memory_order_release);
     }
 }
-
-// Elapsed ms since the first /encrypt request (the metric the competition scores).
 static double batch_wall_ms() {
     if (!g_t_batch_set.load(std::memory_order_acquire)) return 0.0;
     return tms(g_t_batch_start, tnow());
 }
-
-// Called at the end of every do_encrypt().
-// Collects stats, increments done counter, prints [BATCH] when all finish.
 static void batch_req_done(double total_ms, double encrypt_ms, double cb_ms) {
     {
         std::lock_guard<std::mutex> lk(g_batch_mu);
@@ -266,11 +272,9 @@ static void batch_req_done(double total_ms, double encrypt_ms, double cb_ms) {
     int done = ++g_req_done;
     if (g_expect_reqs <= 0 || done != g_expect_reqs) return;
 
-    // All expected requests finished — print aggregate summary.
     double wall = batch_wall_ms();
     std::lock_guard<std::mutex> lk(g_batch_mu);
-    double s_tot=0, s_enc=0, s_cb=0;
-    double mn_tot=1e9, mx_tot=0, mn_enc=1e9, mx_enc=0;
+    double s_tot=0, s_enc=0, s_cb=0, mn_tot=1e9, mx_tot=0, mn_enc=1e9, mx_enc=0;
     for (auto& s : g_req_stats) {
         s_tot += s.total_ms;
         if (s.total_ms < mn_tot) mn_tot = s.total_ms;
@@ -282,8 +286,7 @@ static void batch_req_done(double total_ms, double encrypt_ms, double cb_ms) {
     }
     int n = (int)g_req_stats.size();
     fprintf(stderr,
-        "\n[BATCH] %d/%d done"
-        "  wall=%.0fms"
+        "\n[BATCH] %d/%d done  wall=%.0fms"
         "  | req  avg=%.0f min=%.0f max=%.0f"
         "  | enc  avg=%.0f min=%.0f max=%.0f"
         "  | cb   avg=%.0fms\n\n",
@@ -302,7 +305,6 @@ static void write_all(int fd, const char* p, size_t n) {
         p += w; n -= w;
     }
 }
-
 static void send_json(int fd, int status, const std::string& body) {
     char hdr[256];
     int hlen = snprintf(hdr, sizeof(hdr),
@@ -315,17 +317,13 @@ static void send_json(int fd, int status, const std::string& body) {
     write_all(fd, body.data(), body.size());
 }
 
-// ─── HTTP request reader ──────────────────────────────────────────────────────
-
 struct HttpReq { std::string method, path, body; };
 
 static bool read_http(int fd, HttpReq& req) {
-    // Read until \r\n\r\n (end of headers)
     std::string raw;
     raw.reserve(4096);
     char buf[4096];
     size_t hend = std::string::npos;
-
     while (hend == std::string::npos) {
         ssize_t n = recv(fd, buf, sizeof(buf), 0);
         if (n <= 0) return false;
@@ -333,9 +331,8 @@ static bool read_http(int fd, HttpReq& req) {
         hend = raw.find("\r\n\r\n");
         if (raw.size() > 131072) return false;
     }
-    hend += 4; // skip \r\n\r\n
+    hend += 4;
 
-    // Parse request line
     size_t crlf1 = raw.find("\r\n");
     if (crlf1 == std::string::npos) return false;
     std::string rline = raw.substr(0, crlf1);
@@ -347,21 +344,15 @@ static bool read_http(int fd, HttpReq& req) {
                ? rline.substr(sp1+1, sp2-sp1-1)
                : rline.substr(sp1+1);
 
-    // Find Content-Length (case-insensitive)
-    std::string hdrs = raw.substr(0, hend);
-    std::string hdrs_lo = hdrs;
+    std::string hdrs_lo = raw.substr(0, hend);
     std::transform(hdrs_lo.begin(), hdrs_lo.end(), hdrs_lo.begin(), ::tolower);
-
     size_t cl = 0;
     size_t clpos = hdrs_lo.find("content-length:");
     if (clpos != std::string::npos) {
         size_t vs = hdrs_lo.find_first_not_of(" \t", clpos + 15);
-        if (vs != std::string::npos)
-            cl = std::stoul(hdrs_lo.substr(vs));
+        if (vs != std::string::npos) cl = std::stoul(hdrs_lo.substr(vs));
     }
-
     if (cl > 0) {
-        // Some body bytes may already be in raw
         size_t already = (raw.size() > hend) ? (raw.size() - hend) : 0;
         req.body.resize(cl);
         if (already > 0)
@@ -376,7 +367,7 @@ static bool read_http(int fd, HttpReq& req) {
     return true;
 }
 
-// ─── JSON helpers (minimal, no external dep) ──────────────────────────────────
+// ─── JSON helpers ─────────────────────────────────────────────────────────────
 
 static std::string json_str(const std::string& j, const std::string& key) {
     std::string k = "\"" + key + "\"";
@@ -390,7 +381,6 @@ static std::string json_str(const std::string& j, const std::string& key) {
     if (q2 == std::string::npos) return {};
     return j.substr(q1 + 1, q2 - q1 - 1);
 }
-
 static std::vector<std::string> json_arr(const std::string& j, const std::string& key) {
     std::string k = "\"" + key + "\"";
     size_t p = j.find(k);
@@ -416,13 +406,11 @@ static std::vector<std::string> json_arr(const std::string& j, const std::string
 // ─── HTTP POST callback ───────────────────────────────────────────────────────
 
 static bool http_post(const std::string& url, const std::string& body) {
-    // Parse http://host[:port]/path
     std::string u = url;
     if (u.rfind("http://", 0) == 0) u = u.substr(7);
     size_t sl = u.find('/');
     std::string hostport = (sl == std::string::npos) ? u : u.substr(0, sl);
     std::string path     = (sl == std::string::npos) ? "/" : u.substr(sl);
-
     std::string host = hostport;
     int port = 80;
     size_t colon = hostport.find(':');
@@ -430,18 +418,15 @@ static bool http_post(const std::string& url, const std::string& body) {
         host = hostport.substr(0, colon);
         port = std::stoi(hostport.substr(colon + 1));
     }
-
     struct addrinfo hints{}, *res = nullptr;
     hints.ai_family   = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     std::string ports = std::to_string(port);
     if (getaddrinfo(host.c_str(), ports.c_str(), &hints, &res) != 0) return false;
-
     int sock = socket(AF_INET, SOCK_STREAM, 0);
     struct timeval tv{5, 0};
     setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
-
     bool ok = false;
     if (connect(sock, res->ai_addr, res->ai_addrlen) == 0) {
         std::string req =
@@ -458,291 +443,302 @@ static bool http_post(const std::string& url, const std::string& body) {
     return ok;
 }
 
-// ─── Vectorized hex encoder (AVX2) ───────────────────────────────────────────
-//
-// hex16_avx2: 16 bytes → 32 uppercase hex chars, one AVX2 store.
-//
-// Algorithm (all ops run in 256-bit AVX2):
-//  1. Broadcast the 16 input bytes into both 128-bit lanes of a ymm register.
-//  2. Extract high nibbles  (>> 4 within each 16-bit element, then & 0x0f).
-//  3. Extract low  nibbles  (& 0x0f).
-//  4. Translate nibbles to ASCII via vpshufb against "0123456789ABCDEF" LUT.
-//  5. Interleave hi/lo chars within each 128-bit lane:
-//       lane 0 → chars for input bytes 0-7  (16 bytes)
-//       lane 1 → chars for input bytes 8-15 (16 bytes)
-//  6. Permute lanes into sequential order → 32-byte ymm store.
-//
-// hex_encode: loops hex16_avx2 over n bytes (n must be a multiple of 16).
-// All SM4-CBC ciphertext satisfies this: block size = 16, PKCS7 always pads
-// to a 16-byte multiple.
+// ─── AVX2 hex encoder ────────────────────────────────────────────────────────
 
 static inline void hex16_avx2(const uint8_t* __restrict__ src,
                                char*          __restrict__ dst) {
-    // LUT: byte i = ASCII char for nibble value i  ('0'..'9','A'..'F')
     const __m256i lut  = _mm256_broadcastsi128_si256(
         _mm_set_epi8('F','E','D','C','B','A','9','8',
                      '7','6','5','4','3','2','1','0'));
     const __m256i mask = _mm256_set1_epi8(0x0f);
-
-    // Broadcast 16 input bytes into both 128-bit lanes.
     __m256i data = _mm256_broadcastsi128_si256(
                        _mm_loadu_si128((const __m128i*)src));
-
-    // Isolate nibbles.  _mm256_srli_epi16 shifts within each 16-bit element;
-    // masking with 0x0f then gives the correct high nibble of every byte.
-    __m256i hi = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
-    __m256i lo = _mm256_and_si256(data, mask);
-
-    // Translate nibbles → ASCII.
+    __m256i hi   = _mm256_and_si256(_mm256_srli_epi16(data, 4), mask);
+    __m256i lo   = _mm256_and_si256(data, mask);
     __m256i hi_c = _mm256_shuffle_epi8(lut, hi);
     __m256i lo_c = _mm256_shuffle_epi8(lut, lo);
-
-    // Interleave (within each 128-bit lane):
-    //   unpacklo → chars for input bytes 0-3  (lane 0) / 8-11  (lane 1)
-    //   unpackhi → chars for input bytes 4-7  (lane 0) / 12-15 (lane 1)
     __m256i u_lo = _mm256_unpacklo_epi8(hi_c, lo_c);
     __m256i u_hi = _mm256_unpackhi_epi8(hi_c, lo_c);
-
-    // Permute so that lane 0 of result = chars for bytes 0-7,
-    //                  lane 1 of result = chars for bytes 8-15.
-    // imm8=0x20: result_lane0 = u_lo_lane0, result_lane1 = u_hi_lane0.
     _mm256_storeu_si256((__m256i*)dst,
         _mm256_permute2x128_si256(u_lo, u_hi, 0x20));
 }
-
-// Encode `n` bytes of SM4 ciphertext as uppercase hex into `dst`.
-// n must be a multiple of 16 (guaranteed by SM4 PKCS7 padding).
 static inline void hex_encode(const uint8_t* __restrict__ src,
-                               char*          __restrict__ dst,
-                               size_t n) {
+                               char*          __restrict__ dst, size_t n) {
     for (size_t i = 0; i < n; i += 16)
         hex16_avx2(src + i, dst + i * 2);
 }
 
-// ─── Encrypt job ─────────────────────────────────────────────────────────────
+// ─── Per-request batch state ──────────────────────────────────────────────────
 
-static void do_encrypt(std::string requestId, std::string ip,
-                        std::string sm4Key, std::vector<std::string> fields) {
-    auto t_start = tnow();
-    try {
-        // ── 1. CSV ready ───────────────────────────────────────────────────
-        ensure_csv();
-        auto t_csv = tnow();
-        TLOG("%-32s  csv_wait=%6.1fms", requestId.c_str(), tms(t_start, t_csv));
+struct BatchReq {
+    std::string request_id;
+    std::string ip;
+    SM4Ctx      ctx;           // pre-expanded round keys
 
-        // ── 2. SM4 key schedule ────────────────────────────────────────────
-        SM4Ctx ctx;
-        uint8_t key16[16] = {};
-        size_t klen = std::min(sm4Key.size(), (size_t)16);
-        memcpy(key16, sm4Key.data(), klen);
-        sm4_init(ctx, key16);
-        auto t_init = tnow();
-        TLOG("%-32s  sm4_init=%6.3fms", requestId.c_str(), tms(t_csv, t_init));
+    int  nfields    = 0;
+    int  col[11]    = {};
+    bool is_sm4[11] = {};
+    int  sm4idx[11] = {};      // SM4 field idx (0-6) or -1
+    int  maskidx[11]= {};      // mask idx (0-3) or -1
 
-        // ── 3. Resolve fields ──────────────────────────────────────────────
-        std::vector<FieldInfo> finfos;
-        finfos.reserve(fields.size());
-        for (const auto& f : fields) {
-            auto it = FIELDS.find(f);
-            if (it == FIELDS.end())
-                throw std::runtime_error("Unknown field: " + f);
-            finfos.push_back(it->second);
+    // Pre-allocated output buffer.
+    // row_offset[r] = byte offset of row r in out_buf.
+    // row_offset[nrows] = total size.
+    std::string              out_buf;
+    std::vector<uint32_t>    row_offset;
+
+    std::string out_path;
+    TPoint      t_req_start;
+};
+
+// ─── submit_and_wait helper ───────────────────────────────────────────────────
+// Submit `count` tasks fn(0)..fn(count-1) to g_work_pool and block until all
+// complete.  Must NOT be called from a g_work_pool thread (would deadlock).
+
+static void submit_and_wait(size_t count, std::function<void(size_t)> fn) {
+    if (count == 0) return;
+    std::atomic<int>        remaining((int)count);
+    std::mutex              m;
+    std::condition_variable cv;
+    bool                    all_done = false;
+
+    for (size_t i = 0; i < count; i++) {
+        g_work_pool->submit([&, i]() {
+            fn(i);
+            if (--remaining == 0) {
+                std::lock_guard<std::mutex> lk(m);
+                all_done = true;
+                cv.notify_all();
+            }
+        });
+    }
+    std::unique_lock<std::mutex> lk(m);
+    cv.wait(lk, [&]{ return all_done; });
+}
+
+// ─── Per-request row-range compute ───────────────────────────────────────────
+
+static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
+    if (row_start >= row_end) return;
+
+    constexpr size_t B = 16;
+    char* base = req->out_buf.data();
+
+    // Ciphertext staging (stack): max 4 SM4 blocks = 64 bytes per chain
+    alignas(64) uint8_t ct_s[B][64];
+    const uint8_t* pt_p[B];
+    size_t         ct_l[B];
+    uint8_t*       ct_p[B];
+    for (size_t b = 0; b < B; b++) ct_p[b] = ct_s[b];
+
+    const size_t full = row_start + ((row_end - row_start) / B) * B;
+
+    // ── x16 AVX-512 path ─────────────────────────────────────────────────────
+    for (size_t base_row = row_start; base_row < full; base_row += B) {
+        char* wp[B];
+        for (size_t b = 0; b < B; b++)
+            wp[b] = base + req->row_offset[base_row + b];
+
+        for (int fi = 0; fi < req->nfields; fi++) {
+            if (fi > 0)
+                for (size_t b = 0; b < B; b++) *wp[b]++ = ',';
+
+            if (req->is_sm4[fi]) {
+                int sidx = req->sm4idx[fi];
+                const SM4PaddedField& spf = g_sm4_pad[sidx];
+                for (size_t b = 0; b < B; b++) {
+                    size_t r = base_row + b;
+                    pt_p[b] = spf.blob.data() + spf.offset[r];
+                    ct_l[b] = spf.padlen[r];
+                }
+                sm4_cbc_encrypt_x16_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+                for (size_t b = 0; b < B; b++) {
+                    if (ct_l[b] == 0) continue;
+                    hex_encode(ct_s[b], wp[b], ct_l[b]);
+                    wp[b] += ct_l[b] * 2;
+                }
+            } else {
+                int midx = req->maskidx[fi];
+                for (size_t b = 0; b < B; b++) {
+                    size_t r = base_row + b;
+                    const std::string& m = g_masked_col[midx][r];
+                    memcpy(wp[b], m.data(), m.size());
+                    wp[b] += m.size();
+                }
+            }
         }
-        auto t_fields = tnow();
-        TLOG("%-32s  fields=%6.3fms", requestId.c_str(), tms(t_init, t_fields));
+        for (size_t b = 0; b < B; b++) *wp[b] = '\n';
+    }
 
-        // ── 4. Prepare output path ─────────────────────────────────────────
-        std::filesystem::create_directories(g_output_dir);
-        std::string outpath = g_output_dir + requestId + ".csv";
-        auto t_open = tnow();
-        TLOG("%-32s  dir=%6.3fms", requestId.c_str(), tms(t_fields, t_open));
-
-        // ── 5. Encrypt rows ────────────────────────────────────────────────
-        const size_t nrows = g_nrows;
-
-        // Shared scalar helper: build one complete output line for row_idx.
-        auto scalar_row = [&](std::string& ln, size_t row_idx) {
-            uint8_t ct_buf[64];
-            ln.clear();
-            for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
-                if (fi_i > 0) ln += ',';
-                const auto& fi = finfos[fi_i];
-                if (fi.is_sm4) {
-                    const std::string& val = g_cols[fi.col][row_idx];
-                    if (!val.empty()) {
-                        size_t cl = sm4_cbc_encrypt_into(ctx, SM4_IV,
-                                        (const uint8_t*)val.data(), val.size(), ct_buf);
-                        size_t s = ln.size();
-                        ln.resize(s + cl * 2);
-                        hex_encode(ct_buf, ln.data() + s, cl);
-                    }
-                } else {
-                    ln += g_masked_col[fi.col - 4][row_idx];
+    // ── scalar remainder (last nrows % 16 rows) ───────────────────────────────
+    for (size_t r = full; r < row_end; r++) {
+        char* p = base + req->row_offset[r];
+        for (int fi = 0; fi < req->nfields; fi++) {
+            if (fi > 0) *p++ = ',';
+            if (req->is_sm4[fi]) {
+                int sidx = req->sm4idx[fi];
+                // Use original plaintext from g_cols for scalar path
+                const std::string& val = g_cols[SM4IDX_TO_COL[sidx]][r];
+                if (!val.empty()) {
+                    uint8_t ct[64];
+                    size_t cl = sm4_cbc_encrypt_into(req->ctx, SM4_IV,
+                        (const uint8_t*)val.data(), val.size(), ct);
+                    hex_encode(ct, p, cl);
+                    p += cl * 2;
                 }
+            } else {
+                int midx = req->maskidx[fi];
+                const std::string& m = g_masked_col[midx][r];
+                memcpy(p, m.data(), m.size());
+                p += m.size();
             }
-            ln += '\n';
-        };
+        }
+        *p = '\n';
+    }
+}
 
-        // Timing points inside the encrypt block (declared here, assigned inside).
-        TPoint t_alloc, t_avx, t_scalar;
+// ─── Batch processor ──────────────────────────────────────────────────────────
+//
+// Called ONCE per batch from a conn-pool thread (never g_work_pool).
+//
+// Phase 1: parallel pre-computation of row_offset[] + out_buf allocation.
+// Phase 2: encrypt+mask all rows, chunk-first task ordering for L3 cache reuse.
+// Phase 3: write output files + callbacks.
 
-        // ── AVX-512 path: process 16 rows at a time ────────────────────
-        {
-            constexpr size_t B = 16;
+static void process_batch(std::vector<BatchReq*> batch) {
+    if (batch.empty()) return;
+    auto t_batch = tnow();
+    const size_t nrows = g_nrows;
+    ensure_csv();
 
-            // Single contiguous output buffer — one fwrite at the end.
-            // Reserve based on worst case: 2 SM4 blocks (64 hex chars) per
-            // field + comma + newline margin.
-            std::string out_buf;
-            out_buf.reserve(nrows * (finfos.size() * 66 + 2));
-            auto t_alloc = tnow();
-            TLOG("%-32s  alloc=%6.3fms", requestId.c_str(), tms(t_open, t_alloc));
-
-            // write_ptr[b] tracks current write position for each row directly
-            // inside out_buf — no intermediate lbufs copy needed.
-            size_t row_sizes[B];
-            char*  write_ptr[B];
-
-            const uint8_t* pt_p[B];
-            size_t         pt_l[B];
-            alignas(64) uint8_t ct_s[B][64];   // ciphertext staging (max 4 blocks)
-            uint8_t*       ct_p[B];
-            size_t         ct_l[B];
-            for (size_t b = 0; b < B; ++b) ct_p[b] = ct_s[b];
-
-            const size_t full = (nrows / B) * B;
-
-            for (size_t base = 0; base < full; base += B) {
-                // ── phase 1: compute exact output byte count per row ─────────
-                for (size_t b = 0; b < B; ++b) row_sizes[b] = 1; // newline
-                for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
-                    const auto& fi = finfos[fi_i];
-                    size_t comma = (fi_i > 0) ? 1 : 0;
-                    if (fi.is_sm4) {
-                        for (size_t b = 0; b < B; ++b) {
-                            size_t plen = g_cols[fi.col][base + b].size();
-                            row_sizes[b] += comma + (plen > 0 ? ((plen / 16) + 1) * 32 : 0);
-                        }
-                    } else {
-                        int midx = fi.col - 4;
-                        for (size_t b = 0; b < B; ++b)
-                            row_sizes[b] += comma + g_masked_col[midx][base + b].size();
-                    }
-                }
-
-                // ── phase 2: extend out_buf once, assign per-row pointers ────
-                {
-                    size_t batch_total = 0;
-                    for (size_t b = 0; b < B; ++b) batch_total += row_sizes[b];
-                    size_t batch_start = out_buf.size();
-                    out_buf.resize(batch_start + batch_total);
-                    char* p = out_buf.data() + batch_start;
-                    for (size_t b = 0; b < B; ++b) {
-                        write_ptr[b] = p;
-                        p[row_sizes[b] - 1] = '\n'; // stamp newline at row end
-                        p += row_sizes[b];
-                    }
-                }
-
-                // ── phase 3: fill fields column-major (SM4 still x16) ────────
-                for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
-                    const auto& fi = finfos[fi_i];
-                    if (fi.is_sm4) {
-                        // Gather 16 plaintexts from the same column.
-                        for (size_t b = 0; b < B; ++b) {
-                            const std::string& val = g_cols[fi.col][base + b];
-                            pt_p[b] = (const uint8_t*)val.data();
-                            pt_l[b] = val.size();
-                        }
-                        sm4_cbc_encrypt_x16(ctx, SM4_IV, pt_p, pt_l, ct_p, ct_l);
-                        for (size_t b = 0; b < B; ++b) {
-                            if (fi_i > 0) *write_ptr[b]++ = ',';
-                            if (ct_l[b] == 0) continue;
-                            hex_encode(ct_s[b], write_ptr[b], ct_l[b]);
-                            write_ptr[b] += ct_l[b] * 2;
-                        }
-                    } else {
-                        int midx = fi.col - 4;
-                        for (size_t b = 0; b < B; ++b) {
-                            if (fi_i > 0) *write_ptr[b]++ = ',';
-                            const std::string& m = g_masked_col[midx][base + b];
-                            memcpy(write_ptr[b], m.data(), m.size());
-                            write_ptr[b] += m.size();
-                        }
-                    }
-                }
+    // ── Phase 1: row offsets + output buffer allocation ───────────────────────
+    submit_and_wait(batch.size(), [&](size_t i) {
+        BatchReq* req = batch[i];
+        req->row_offset.resize(nrows + 1);
+        uint32_t off = 0;
+        for (size_t r = 0; r < nrows; r++) {
+            req->row_offset[r] = off;
+            uint32_t rsz = 1; // newline
+            for (int fi = 0; fi < req->nfields; fi++) {
+                if (fi > 0) rsz++;
+                if (req->is_sm4[fi])
+                    rsz += (uint32_t)g_sm4_pad[req->sm4idx[fi]].padlen[r] * 2u;
+                else
+                    rsz += g_mask_outlen[req->maskidx[fi]][r];
             }
-            auto t_avx = tnow();
-            TLOG("%-32s  avx=%7.2fms  full_rows=%zu", requestId.c_str(), tms(t_alloc, t_avx), full);
+            off += rsz;
+        }
+        req->row_offset[nrows] = off;
+        req->out_buf.resize(off);
+    });
+    auto t_alloc = tnow();
 
-            // Scalar remainder for the last (nrows % 16) rows.
-            std::string line;
-            line.reserve(512);
-            for (size_t row_idx = full; row_idx < nrows; ++row_idx) {
-                scalar_row(line, row_idx);
-                out_buf.append(line);
-            }
-            auto t_scalar = tnow();
-            TLOG("%-32s  rem=%7.3fms  rem_rows=%zu", requestId.c_str(), tms(t_avx, t_scalar), nrows - full);
+    // ── Phase 2: encrypt + mask, chunk-first task order ───────────────────────
+    //
+    // Chunk-first order: all 100 tasks for chunk 0 are submitted before chunk 1.
+    // Workers processing the same row range across different requests share the
+    // same column slice in L3 cache → avoids redundant cache-line loads.
+    //
+    // CHUNK_SIZE = 8192: one request's working set per task ≈
+    //   8192 rows × avg 3.5 SM4 fields × 16 bytes/padlen ≈ 458 KB → L2/L3 warm.
 
-            // ── 6. Single write ────────────────────────────────────────────
-            // One fwrite call instead of 300k ofs.write() calls.
-            FILE* fp = fopen(outpath.c_str(), "wb");
-            if (!fp) throw std::runtime_error("Cannot write: " + outpath);
-            fwrite(out_buf.data(), 1, out_buf.size(), fp);
+    constexpr size_t CHUNK_SIZE = 8192;
+    const size_t n_chunks = (nrows + CHUNK_SIZE - 1) / CHUNK_SIZE;
+
+    struct CTask { BatchReq* req; size_t rs, re; };
+    std::vector<CTask> ctasks;
+    ctasks.reserve(n_chunks * batch.size());
+    for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+        size_t rs = chunk * CHUNK_SIZE;
+        size_t re = std::min(rs + CHUNK_SIZE, nrows);
+        for (auto* req : batch)
+            ctasks.push_back({req, rs, re});
+    }
+    submit_and_wait(ctasks.size(), [&](size_t i) {
+        compute_rows(ctasks[i].req, ctasks[i].rs, ctasks[i].re);
+    });
+    auto t_compute = tnow();
+
+    // ── Phase 3: write files + callbacks ─────────────────────────────────────
+    std::filesystem::create_directories(g_output_dir);
+
+    submit_and_wait(batch.size(), [&](size_t i) {
+        BatchReq* req = batch[i];
+        auto t_enc_end = tnow();
+
+        FILE* fp = fopen(req->out_path.c_str(), "wb");
+        if (fp) {
+            fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
             fclose(fp);
         }
-        auto t_encrypt = tnow();
-        TLOG("%-32s  wr=%7.3fms  bytes=%zu",
-             requestId.c_str(), tms(t_scalar, t_encrypt), nrows * (finfos.size() * 66 + 2));
+        auto t_wr = tnow();
 
-        // ── 7. Callback ────────────────────────────────────────────────────
+        double cb_ms = 0.0;
         if (!g_callback_url.empty() && g_callback_url != "skip") {
+            auto t_cb0 = tnow();
             std::string cb =
                 "{\"teamCode\":\"" + g_team_code + "\","
-                "\"requestId\":\"" + requestId + "\","
-                "\"ip\":\"" + ip + "\"}";
-            for (int i = 0; i < 5; i++) {
+                "\"requestId\":\"" + req->request_id + "\","
+                "\"ip\":\"" + req->ip + "\"}";
+            for (int retry = 0; retry < 5; retry++) {
                 if (http_post(g_callback_url, cb)) break;
                 usleep(50000);
             }
+            cb_ms = tms(t_cb0, tnow());
         }
-        auto t_cb = tnow();
-        TLOG("%-32s  callback=%6.1fms", requestId.c_str(), tms(t_encrypt, t_cb));
 
-        // ── Summary (always printed) ───────────────────────────────────────
-        double d_total   = tms(t_start,  t_cb);
-        double d_csv     = tms(t_start,  t_csv);
-        double d_key     = tms(t_csv,    t_init);
-        double d_fields  = tms(t_init,   t_fields);
-        double d_dir     = tms(t_fields, t_open);
-        double d_alloc   = tms(t_open,   t_alloc);
-        double d_avx     = tms(t_alloc,  t_avx);
-        double d_scalar  = tms(t_avx,    t_scalar);
-        double d_wr      = tms(t_scalar, t_encrypt);
-        double d_cb      = tms(t_encrypt, t_cb);
-        double d_enc     = tms(t_open,   t_encrypt);  // alloc+avx+rem+wr combined
-        double d_wall    = batch_wall_ms();
-        int    done      = g_req_done.load() + 1;  // +1: will be incremented below
-        int    submitted = g_req_submitted.load();
+        double d_total = tms(req->t_req_start, tnow());
+        double d_enc   = tms(t_batch, t_compute);  // shared batch compute time
+        double d_wr    = tms(t_enc_end, t_wr);
+        double d_wall  = batch_wall_ms();
+        int    done    = g_req_done.load() + 1;
+        int    subm    = g_req_submitted.load();
 
         fprintf(stderr,
             "[DONE] %-28s [%3d/%-3d]  req=%7.1fms  wall=%7.1fms"
-            "  csv=%5.1f  key=%.2f  fld=%.2f  dir=%.2f"
-            "  alloc=%5.2f  avx=%6.1f  rem=%5.2f  wr=%5.2f  cb=%5.1f"
-            "  enc=%6.1f\n",
-            requestId.c_str(), done, submitted,
-            d_total, d_wall,
-            d_csv, d_key, d_fields, d_dir,
-            d_alloc, d_avx, d_scalar, d_wr, d_cb,
-            d_enc);
+            "  enc=%6.1f  wr=%5.2f  cb=%5.1f\n",
+            req->request_id.c_str(), done, subm,
+            d_total, d_wall, d_enc, d_wr, cb_ms);
 
-        batch_req_done(d_total, d_enc, d_cb);  // increments g_req_done, triggers [BATCH]
+        batch_req_done(d_total, d_enc, cb_ms);
+    });
 
-    } catch (const std::exception& e) {
-        fprintf(stderr, "[ERROR] %s: %s  elapsed=%.1fms\n",
-                requestId.c_str(), e.what(), tms(t_start, tnow()));
+    auto t_end = tnow();
+    fprintf(stderr,
+        "[BATCH_PHASES] n=%zu  alloc=%.1fms  compute=%.1fms  output=%.1fms  total=%.1fms\n",
+        batch.size(),
+        tms(t_batch, t_alloc), tms(t_alloc, t_compute),
+        tms(t_compute, t_end), tms(t_batch, t_end));
+
+    for (auto* req : batch) delete req;
+}
+
+// ─── Batch collector ─────────────────────────────────────────────────────────
+//
+// Accumulates incoming /encrypt requests until we have g_coord_batch_size of
+// them, then the conn thread that fills the batch fires process_batch() inline.
+// Other conn threads return immediately after adding their request.
+//
+// For subsequent waves (if any), the collector resets automatically.
+
+static std::mutex              g_coord_mu;
+static std::vector<BatchReq*>  g_coord_pending;
+static int                     g_coord_batch_size = 100;
+
+static void coord_add(BatchReq* req) {
+    std::vector<BatchReq*> to_fire;
+    {
+        std::lock_guard<std::mutex> lk(g_coord_mu);
+        g_coord_pending.push_back(req);
+        if ((int)g_coord_pending.size() >= g_coord_batch_size) {
+            to_fire = std::move(g_coord_pending);
+            g_coord_pending.clear();
+        }
     }
+    // Only the thread that completes the batch runs process_batch.
+    // All other threads return immediately.
+    if (!to_fire.empty())
+        process_batch(std::move(to_fire));
 }
 
 // ─── Connection handler ───────────────────────────────────────────────────────
@@ -752,6 +748,7 @@ static void handle_conn(int fd) {
     if (!read_http(fd, req)) { close(fd); return; }
 
     if (req.method == "GET" && req.path == "/health") {
+        ensure_csv();
         send_json(fd, 200, R"({"returnCode":"SUC0000","body": true,"errorMsg":""})");
 
     } else if (req.method == "POST" && req.path == "/encrypt") {
@@ -760,18 +757,43 @@ static void handle_conn(int fd) {
         std::string ip     = json_str(req.body, "ip");
         auto        fields = json_arr(req.body, "fieldsToEncrypt");
 
-        batch_mark_start();          // record time of first /encrypt (idempotent)
+        batch_mark_start();
         g_req_submitted.fetch_add(1, std::memory_order_relaxed);
 
-        // Respond immediately; process in background
+        // Send HTTP 200 immediately (before any computation)
         send_json(fd, 200, R"({"returnCode":"SUC0000","body": true,"errorMsg":""})");
         close(fd);
         fd = -1;
 
-        g_work_pool->submit([=]() mutable {
-            do_encrypt(std::move(rid), std::move(ip),
-                       std::move(key), std::move(fields));
-        });
+        // Build request state (lightweight: parse + key expand only)
+        auto* breq = new BatchReq;
+        breq->t_req_start = tnow();
+        breq->request_id  = rid;
+        breq->ip          = ip;
+        breq->out_path    = g_output_dir + rid + ".csv";
+
+        bool ok = true;
+        for (const auto& f : fields) {
+            auto it = FIELDS.find(f);
+            if (it == FIELDS.end()) { ok = false; break; }
+            int fi = breq->nfields++;
+            breq->col[fi]      = it->second.col;
+            breq->is_sm4[fi]   = it->second.is_sm4;
+            if (it->second.is_sm4) {
+                breq->sm4idx[fi]  = COL_TO_SM4IDX[it->second.col];
+                breq->maskidx[fi] = -1;
+            } else {
+                breq->sm4idx[fi]  = -1;
+                breq->maskidx[fi] = it->second.col - 4;
+            }
+        }
+        if (!ok) { delete breq; return; }
+
+        uint8_t key16[16] = {};
+        memcpy(key16, key.data(), std::min(key.size(), (size_t)16));
+        sm4_init(breq->ctx, key16);
+
+        coord_add(breq);
 
     } else {
         send_json(fd, 404, R"({"returnCode":"ERR0001","body": false,"errorMsg":"not found"})");
@@ -793,34 +815,34 @@ int main() {
     g_team_code    = env("DCC_TEAM_CODE",   "baseline");
     g_callback_url = env("DCC_CALLBACK_URL","http://dcc08-data-encrypt.paas.cmbchina.cn/callback");
     g_debug        = (env("DCC_DEBUG",     "0") == "1");
-    g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));  // 0 = disable [BATCH] summary
+    g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));
     g_port         = std::stoi(env("DCC_PORT",         "8080"));
     g_workers      = std::stoi(env("DCC_WORKERS",      "0"));
 
     if (!g_output_dir.empty() && g_output_dir.back() != '/')
         g_output_dir += '/';
 
-    signal(SIGPIPE, SIG_IGN); // don't crash on broken socket writes
+    signal(SIGPIPE, SIG_IGN);
 
-    // Worker thread pool: DCC_WORKERS overrides; 0 → hardware_concurrency()
     unsigned nw = (g_workers > 0)
                   ? (unsigned)g_workers
                   : std::thread::hardware_concurrency();
     if (nw < 1) nw = 1;
-    // Connection thread pool: fixed 64 threads replaces unbounded detach().
-    // Conn threads are I/O-bound and short-lived (recv + queue + send), so 64
-    // handles 100 concurrent connections without growing thread count unboundedly.
     unsigned nc = 64;
+
+    g_coord_batch_size = (g_expect_reqs > 0) ? g_expect_reqs : 100;
+
     std::cerr << "[INFO] Workers: " << nw << "  Conn pool: " << nc
+              << "  BatchSize: " << g_coord_batch_size
               << "  AVX-512: ON"
               << "  CSV: " << g_csv_path
               << "  Out: " << g_output_dir << "\n";
+
     g_work_pool = new ThreadPool(nw);
     g_conn_pool = new ThreadPool(nc);
 
-    // Server socket
     int srv = socket(AF_INET, SOCK_STREAM, 0);
-    int opt = 1;
+    int opt  = 1;
     setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
     struct sockaddr_in addr{};
@@ -834,10 +856,7 @@ int main() {
     listen(srv, 512);
     std::cerr << "[INFO] Listening on :" << g_port << "\n";
 
-    // Accept loop — submit to bounded pool instead of unbounded detach.
-    // Also set per-connection recv/send timeouts so hung clients don't
-    // permanently consume a conn-pool thread.
-    struct timeval conn_tv{10, 0};  // 10 s timeout per connection
+    struct timeval conn_tv{10, 0};
     while (true) {
         int fd = accept(srv, nullptr, nullptr);
         if (fd < 0) continue;
