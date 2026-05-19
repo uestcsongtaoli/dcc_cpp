@@ -608,8 +608,8 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 static void process_batch(std::vector<BatchReq*> batch) {
     if (batch.empty()) return;
     auto t_batch = tnow();
-    const size_t nrows = g_nrows;
     ensure_csv();
+    const size_t nrows = g_nrows;
 
     // ── Phase 1: row offsets + output buffer allocation ───────────────────────
     submit_and_wait(batch.size(), [&](size_t i) {
