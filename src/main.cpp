@@ -577,15 +577,12 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
             if (fi > 0) *p++ = ',';
             if (req->is_sm4[fi]) {
                 int sidx = req->sm4idx[fi];
-                // Use original plaintext from g_cols for scalar path
                 const std::string& val = g_cols[SM4IDX_TO_COL[sidx]][r];
-                if (!val.empty()) {
-                    uint8_t ct[64];
-                    size_t cl = sm4_cbc_encrypt_into(req->ctx, SM4_IV,
-                        (const uint8_t*)val.data(), val.size(), ct);
-                    hex_encode(ct, p, cl);
-                    p += cl * 2;
-                }
+                uint8_t ct[64];
+                size_t cl = sm4_cbc_encrypt_into(req->ctx, SM4_IV,
+                    (const uint8_t*)val.data(), val.size(), ct);
+                hex_encode(ct, p, cl);
+                p += cl * 2;
             } else {
                 int midx = req->maskidx[fi];
                 const std::string& m = g_masked_col[midx][r];
