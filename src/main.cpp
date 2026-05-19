@@ -37,6 +37,8 @@ static bool        g_debug      = false;
 static int         g_port       = 8080;
 static int         g_workers    = 0;
 static int         g_expect_reqs= 100;
+static int         g_mini_batch = 16;    // DCC_MINI_BATCH: requests per mini-batch
+static int         g_chunk_size = 8192;  // DCC_CHUNK_SIZE: rows per compute task
 
 // ─── Timing ───────────────────────────────────────────────────────────────────
 
@@ -628,8 +630,9 @@ static void process_batch(std::vector<BatchReq*> batch) {
 
     std::filesystem::create_directories(g_output_dir);
 
-    constexpr size_t MINI       = 16;    // requests per mini-batch
-    constexpr size_t CHUNK_SIZE = 8192;  // rows per compute task
+    constexpr size_t MAX_MINI   = 100;   // upper bound for stack arrays
+    const size_t MINI       = (size_t)std::max(1, g_mini_batch);
+    const size_t CHUNK_SIZE = (size_t)std::max(1, g_chunk_size);
     const size_t n_chunks = (nrows + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
     for (size_t mb_start = 0; mb_start < batch.size(); mb_start += MINI) {
@@ -675,11 +678,11 @@ static void process_batch(std::vector<BatchReq*> batch) {
         // ── Phase 2: field-level batch compute ───────────────────────────────
         // Build per-field request lists (field-first = blob stays L1-hot)
         // Arrays sized for max 7 SM4 + 4 mask fields; reqs/fi storage reused.
-        BatchReq* sm4_req_buf[7][MINI];
-        int       sm4_fi_buf [7][MINI];
+        BatchReq* sm4_req_buf[7][MAX_MINI];
+        int       sm4_fi_buf [7][MAX_MINI];
         size_t    sm4_cnt    [7] = {};
-        BatchReq* mask_req_buf[4][MINI];
-        int       mask_fi_buf [4][MINI];
+        BatchReq* mask_req_buf[4][MAX_MINI];
+        int       mask_fi_buf [4][MAX_MINI];
         size_t    mask_cnt   [4] = {};
 
         for (size_t i = 0; i < mb_sz; i++) {
@@ -917,6 +920,8 @@ int main() {
     g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));
     g_port         = std::stoi(env("DCC_PORT",         "8080"));
     g_workers      = std::stoi(env("DCC_WORKERS",      "0"));
+    g_mini_batch   = std::stoi(env("DCC_MINI_BATCH",   "16"));
+    g_chunk_size   = std::stoi(env("DCC_CHUNK_SIZE",   "8192"));
 
     if (!g_output_dir.empty() && g_output_dir.back() != '/')
         g_output_dir += '/';
@@ -933,6 +938,8 @@ int main() {
 
     std::cerr << "[INFO] Workers: " << nw << "  Conn pool: " << nc
               << "  BatchSize: " << g_coord_batch_size
+              << "  MiniBatch: " << g_mini_batch
+              << "  ChunkSize: " << g_chunk_size
               << "  AVX-512: ON"
               << "  CSV: " << g_csv_path
               << "  Out: " << g_output_dir << "\n";
