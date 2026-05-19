@@ -87,9 +87,14 @@ static const std::unordered_map<std::string, FieldInfo> FIELDS = {
     {"secret_code",  {10, true}},
 };
 
-// ─── CSV data cache ───────────────────────────────────────────────────────────
+// ─── CSV data cache (column-oriented) ────────────────────────────────────────
+//
+// g_cols[col][row]: one vector<string> per field column.
+// Sequential access within a batch (rows base..base+15 of the SAME column) is
+// contiguous in memory → hardware prefetcher friendly, no double-pointer chase.
 
-static std::vector<std::vector<std::string>> g_rows;
+static std::vector<std::string> g_cols[11];   // g_cols[col][row]
+static size_t                   g_nrows = 0;
 static std::atomic<bool> g_csv_ready{false};
 static std::mutex g_csv_mu;
 
@@ -102,18 +107,6 @@ static const std::string g_empty_str;
 static std::vector<std::string> g_masked_col[4];
 
 static std::string mask(const std::string& s);  // forward decl; defined below
-
-static std::vector<std::string> parse_line(const std::string& line) {
-    std::vector<std::string> cols;
-    std::string f;
-    f.reserve(32);
-    for (unsigned char c : line) {
-        if (c == ',') { cols.push_back(f); f.clear(); }
-        else if (c != '\r') f += (char)c;
-    }
-    cols.push_back(f);
-    return cols;
-}
 
 // ─── CSV statistics (DCC_CSV_STATS=1) ─────────────────────────────────────────
 //
@@ -130,7 +123,7 @@ static inline uint64_t fnv1a64(const char* s, size_t n) {
 }
 
 static void analyze_csv_stats() {
-    const size_t N = g_rows.size();
+    const size_t N = g_nrows;
     if (N == 0) { CSVLOG("(no rows to analyze)"); return; }
 
     CSVLOG("══════════════ CSV Data Analysis ═════════════════════════════");
@@ -169,9 +162,8 @@ static void analyze_csv_stats() {
         std::unordered_set<uint64_t> hashes;
         hashes.reserve(N);
 
-        for (const auto& row : g_rows) {
-            const std::string& val =
-                (fd.col < (int)row.size()) ? row[fd.col] : g_empty_str;
+        for (size_t r = 0; r < N; ++r) {
+            const std::string& val = g_cols[fd.col][r];
             if (val.empty()) {
                 ++empty_cnt;
                 lens.push_back(0);
@@ -259,27 +251,45 @@ static void load_csv() {
     std::string line;
     std::getline(ifs, line); // skip header
 
+    for (int c = 0; c < 11; ++c) g_cols[c].reserve(320000);
+
     auto t1 = tnow();
     while (std::getline(ifs, line)) {
-        if (!line.empty())
-            g_rows.push_back(parse_line(line));
+        if (line.empty()) continue;
+        // Parse directly into per-column vectors — no intermediate row object.
+        // Trailing \r stripped once per line; field data stays on the stack
+        // until emplace_back moves it into the column vector.
+        const char* p   = line.c_str();
+        const char* end = p + line.size();
+        if (end > p && *(end - 1) == '\r') --end;
+        int col = 0;
+        while (col < 11) {
+            const char* fs = p;
+            while (p < end && *p != ',') ++p;
+            g_cols[col].emplace_back(fs, (size_t)(p - fs));
+            ++col;
+            if (p < end) ++p;  // skip comma
+        }
+        // If line had fewer than 11 fields, fill with empty strings.
+        while (col < 11) { g_cols[col].emplace_back(); ++col; }
     }
+    g_nrows = g_cols[0].size();
     auto t2 = tnow();
 
     // Precompute mask() for all 4 mask columns.
     // id_card=col4→idx0, phone=col5→idx1, name=col6→idx2, email=col7→idx3
     for (int m = 0; m < 4; m++) {
         int col = m + 4;
-        g_masked_col[m].reserve(g_rows.size());
-        for (const auto& row : g_rows)
-            g_masked_col[m].push_back(col < (int)row.size() ? mask(row[col]) : std::string{});
+        g_masked_col[m].reserve(g_nrows);
+        for (size_t r = 0; r < g_nrows; ++r)
+            g_masked_col[m].push_back(mask(g_cols[col][r]));
     }
     auto t3 = tnow();
 
     fprintf(stderr,
         "[INFO] CSV loaded: %zu rows"
         " | open=%.1fms  parse=%.1fms  mask_pre=%.1fms  total=%.1fms\n",
-        g_rows.size(), tms(t0, t1), tms(t1, t2), tms(t2, t3), tms(t0, t3));
+        g_nrows, tms(t0, t1), tms(t1, t2), tms(t2, t3), tms(t0, t3));
 
     if (g_csv_stats) analyze_csv_stats();
 }
@@ -686,28 +696,24 @@ static void do_encrypt(std::string requestId, std::string ip,
             finfos.push_back(it->second);
         }
 
-        // ── 4. Open output file ────────────────────────────────────────────
+        // ── 4. Prepare output path ─────────────────────────────────────────
         std::filesystem::create_directories(g_output_dir);
         std::string outpath = g_output_dir + requestId + ".csv";
-        std::ofstream ofs(outpath, std::ios::binary);
-        if (!ofs) throw std::runtime_error("Cannot write: " + outpath);
         auto t_open = tnow();
         TLOG("%-32s  file_open=%6.2fms", requestId.c_str(), tms(t_init, t_open));
 
         // ── 5. Encrypt rows ────────────────────────────────────────────────
-        const size_t nrows = g_rows.size();
+        const size_t nrows = g_nrows;
 
         // Shared scalar helper: build one complete output line for row_idx.
         auto scalar_row = [&](std::string& ln, size_t row_idx) {
             uint8_t ct_buf[64];
-            const auto& row = g_rows[row_idx];
             ln.clear();
             for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
                 if (fi_i > 0) ln += ',';
                 const auto& fi = finfos[fi_i];
                 if (fi.is_sm4) {
-                    const std::string& val =
-                        (fi.col < (int)row.size()) ? row[fi.col] : g_empty_str;
+                    const std::string& val = g_cols[fi.col][row_idx];
                     if (!val.empty()) {
                         size_t cl = sm4_cbc_encrypt_into(ctx, SM4_IV,
                                         (const uint8_t*)val.data(), val.size(), ct_buf);
@@ -725,6 +731,13 @@ static void do_encrypt(std::string requestId, std::string ip,
         // ── AVX-512 path: process 16 rows at a time ────────────────────
         {
             constexpr size_t B = 16;
+
+            // Single contiguous output buffer — one fwrite at the end.
+            // Reserve based on worst case: 2 SM4 blocks (64 hex chars) per
+            // field + comma + newline margin.
+            std::string out_buf;
+            out_buf.reserve(nrows * (finfos.size() * 66 + 2));
+
             std::string lbufs[B];
             for (auto& lb : lbufs) lb.reserve(512);
 
@@ -743,11 +756,10 @@ static void do_encrypt(std::string requestId, std::string ip,
                 for (size_t fi_i = 0; fi_i < finfos.size(); ++fi_i) {
                     const auto& fi = finfos[fi_i];
                     if (fi.is_sm4) {
-                        // Gather 16 plaintexts, encrypt in parallel.
+                        // Gather 16 plaintexts from the same column (sequential
+                        // in g_cols[col], cache-friendly with hardware prefetcher).
                         for (size_t b = 0; b < B; ++b) {
-                            const auto& row = g_rows[base + b];
-                            const std::string& val =
-                                (fi.col < (int)row.size()) ? row[fi.col] : g_empty_str;
+                            const std::string& val = g_cols[fi.col][base + b];
                             pt_p[b] = (const uint8_t*)val.data();
                             pt_l[b] = val.size();
                         }
@@ -771,7 +783,7 @@ static void do_encrypt(std::string requestId, std::string ip,
 
                 for (size_t b = 0; b < B; ++b) {
                     lbufs[b] += '\n';
-                    ofs.write(lbufs[b].data(), lbufs[b].size());
+                    out_buf.append(lbufs[b]);
                 }
             }
 
@@ -780,17 +792,23 @@ static void do_encrypt(std::string requestId, std::string ip,
             line.reserve(512);
             for (size_t row_idx = full; row_idx < nrows; ++row_idx) {
                 scalar_row(line, row_idx);
-                ofs.write(line.data(), line.size());
+                out_buf.append(line);
             }
+
+            // ── 6. Single write ────────────────────────────────────────────
+            // One fwrite call instead of 300k ofs.write() calls.
+            FILE* fp = fopen(outpath.c_str(), "wb");
+            if (!fp) throw std::runtime_error("Cannot write: " + outpath);
+            fwrite(out_buf.data(), 1, out_buf.size(), fp);
+            fclose(fp);
         }
         auto t_encrypt = tnow();
         TLOG("%-32s  encrypt=%7.1fms  rows=%zu  fields=%zu",
              requestId.c_str(), tms(t_open, t_encrypt),
-             g_rows.size(), finfos.size());
+             nrows, finfos.size());
 
-        // ── 6. Flush & close ───────────────────────────────────────────────
-        ofs.close();
-        auto t_close = tnow();
+        // flush is now part of the single fwrite/fclose above
+        auto t_close = t_encrypt;
         TLOG("%-32s  flush=%6.2fms", requestId.c_str(), tms(t_encrypt, t_close));
 
         // ── 7. Callback ────────────────────────────────────────────────────
