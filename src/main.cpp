@@ -482,10 +482,13 @@ struct BatchReq {
     int  maskidx[11]= {};      // mask idx (0-3) or -1
 
     // Pre-allocated output buffer.
-    // row_offset[r] = byte offset of row r in out_buf.
-    // row_offset[nrows] = total size.
+    // row_offset[r]          = byte offset of row r in out_buf.
+    // row_offset[nrows]      = total size.
+    // field_out_offset[fi][r] = byte offset of field fi *within* row r
+    //                           (relative to row_offset[r], not counting comma/newline).
     std::string              out_buf;
     std::vector<uint32_t>    row_offset;
+    std::vector<uint32_t>    field_out_offset[11];
 
     std::string out_path;
     TPoint      t_req_start;
@@ -516,81 +519,92 @@ static void submit_and_wait(size_t count, std::function<void(size_t)> fn) {
     cv.wait(lk, [&]{ return all_done; });
 }
 
-// ─── Per-request row-range compute ───────────────────────────────────────────
+// ─── Field-level compute ──────────────────────────────────────────────────────
+//
+// Instead of compute_rows(req, chunk) [all fields, one request], we now have:
+//   compute_field_sm4 (one SM4 field, all mini-batch requests needing it)
+//   compute_field_mask (one mask field, all mini-batch requests needing it)
+//
+// Loop order: row-block OUTER, request INNER.
+// → The 32-row plaintext blob chunk (512 B, fits in L1) stays hot for all N
+//   request encryptions before advancing to the next 32-row block.
 
-static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
-    if (row_start >= row_end) return;
+struct FieldReqs {
+    BatchReq** reqs;
+    const int* fi;     // fi[i] = field position of this field in reqs[i]
+    size_t     n;
+};
 
+static void compute_field_sm4(
+    int sm4idx,
+    size_t row_start, size_t row_end,
+    const FieldReqs& fr)
+{
+    if (fr.n == 0 || row_start >= row_end) return;
+    const SM4PaddedField& spf = g_sm4_pad[sm4idx];
     constexpr size_t B = 32;
-    char* base = req->out_buf.data();
+    const size_t full = row_start + ((row_end - row_start) / B) * B;
 
-    // Ciphertext staging (stack): max 4 SM4 blocks = 64 bytes per chain
     alignas(64) uint8_t ct_s[B][64];
     const uint8_t* pt_p[B];
     size_t         ct_l[B];
     uint8_t*       ct_p[B];
     for (size_t b = 0; b < B; b++) ct_p[b] = ct_s[b];
 
-    const size_t full = row_start + ((row_end - row_start) / B) * B;
-
-    // ── x16 AVX-512 path ─────────────────────────────────────────────────────
+    // ── x32 path: row-block outer, request inner ──────────────────────────────
     for (size_t base_row = row_start; base_row < full; base_row += B) {
-        char* wp[B];
-        for (size_t b = 0; b < B; b++)
-            wp[b] = base + req->row_offset[base_row + b];
-
-        for (int fi = 0; fi < req->nfields; fi++) {
-            if (fi > 0)
-                for (size_t b = 0; b < B; b++) *wp[b]++ = ',';
-
-            if (req->is_sm4[fi]) {
-                int sidx = req->sm4idx[fi];
-                const SM4PaddedField& spf = g_sm4_pad[sidx];
-                for (size_t b = 0; b < B; b++) {
-                    size_t r = base_row + b;
-                    pt_p[b] = spf.blob.data() + spf.offset[r];
-                    ct_l[b] = spf.padlen[r];
-                }
-                sm4_cbc_encrypt_x32_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
-                for (size_t b = 0; b < B; b++) {
-                    if (ct_l[b] == 0) continue;
-                    hex_encode(ct_s[b], wp[b], ct_l[b]);
-                    wp[b] += ct_l[b] * 2;
-                }
-            } else {
-                int midx = req->maskidx[fi];
-                for (size_t b = 0; b < B; b++) {
-                    size_t r = base_row + b;
-                    const std::string& m = g_masked_col[midx][r];
-                    memcpy(wp[b], m.data(), m.size());
-                    wp[b] += m.size();
-                }
+        // Load this block's plaintext once — reused for all N requests below
+        for (size_t b = 0; b < B; b++) {
+            pt_p[b] = spf.blob.data() + spf.offset[base_row + b];
+            ct_l[b] = spf.padlen[base_row + b];
+        }
+        // Encrypt with each request's key (blob chunk stays in L1)
+        for (size_t ri = 0; ri < fr.n; ri++) {
+            BatchReq* req = fr.reqs[ri];
+            int f = fr.fi[ri];
+            sm4_cbc_encrypt_x32_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+            char* base = req->out_buf.data();
+            for (size_t b = 0; b < B; b++) {
+                if (ct_l[b] == 0) continue;
+                size_t r = base_row + b;
+                hex_encode(ct_s[b],
+                           base + req->row_offset[r] + req->field_out_offset[f][r],
+                           ct_l[b]);
             }
         }
-        for (size_t b = 0; b < B; b++) *wp[b] = '\n';
     }
 
-    // ── scalar remainder (last nrows % 16 rows) ───────────────────────────────
+    // ── scalar remainder ──────────────────────────────────────────────────────
     for (size_t r = full; r < row_end; r++) {
-        char* p = base + req->row_offset[r];
-        for (int fi = 0; fi < req->nfields; fi++) {
-            if (fi > 0) *p++ = ',';
-            if (req->is_sm4[fi]) {
-                int sidx = req->sm4idx[fi];
-                const std::string& val = g_cols[SM4IDX_TO_COL[sidx]][r];
-                uint8_t ct[64];
-                size_t cl = sm4_cbc_encrypt_into(req->ctx, SM4_IV,
-                    (const uint8_t*)val.data(), val.size(), ct);
-                hex_encode(ct, p, cl);
-                p += cl * 2;
-            } else {
-                int midx = req->maskidx[fi];
-                const std::string& m = g_masked_col[midx][r];
-                memcpy(p, m.data(), m.size());
-                p += m.size();
-            }
+        const std::string& val = g_cols[SM4IDX_TO_COL[sm4idx]][r];
+        for (size_t ri = 0; ri < fr.n; ri++) {
+            BatchReq* req = fr.reqs[ri];
+            int f = fr.fi[ri];
+            uint8_t ct[64];
+            size_t cl = sm4_cbc_encrypt_into(req->ctx, SM4_IV,
+                (const uint8_t*)val.data(), val.size(), ct);
+            hex_encode(ct,
+                       req->out_buf.data() + req->row_offset[r] + req->field_out_offset[f][r],
+                       cl);
         }
-        *p = '\n';
+    }
+}
+
+static void compute_field_mask(
+    int maskidx,
+    size_t row_start, size_t row_end,
+    const FieldReqs& fr)
+{
+    if (fr.n == 0 || row_start >= row_end) return;
+    // Row outer, request inner: g_masked_col[maskidx][r] stays cache-warm
+    for (size_t r = row_start; r < row_end; r++) {
+        const std::string& m = g_masked_col[maskidx][r];
+        for (size_t ri = 0; ri < fr.n; ri++) {
+            BatchReq* req = fr.reqs[ri];
+            int f = fr.fi[ri];
+            memcpy(req->out_buf.data() + req->row_offset[r] + req->field_out_offset[f][r],
+                   m.data(), m.size());
+        }
     }
 }
 
@@ -618,46 +632,103 @@ static void process_batch(std::vector<BatchReq*> batch) {
     constexpr size_t CHUNK_SIZE = 8192;  // rows per compute task
     const size_t n_chunks = (nrows + CHUNK_SIZE - 1) / CHUNK_SIZE;
 
-    struct CTask { BatchReq* req; size_t rs, re; };
-
     for (size_t mb_start = 0; mb_start < batch.size(); mb_start += MINI) {
         size_t     mb_end = std::min(mb_start + MINI, batch.size());
         size_t     mb_sz  = mb_end - mb_start;
         BatchReq** mb     = batch.data() + mb_start;
         auto t_mb = tnow();
 
-        // ── Phase 1: row offsets + output buffer allocation ───────────────────
+        // ── Phase 1: row offsets + field offsets + out_buf alloc ─────────────
         submit_and_wait(mb_sz, [&](size_t i) {
             BatchReq* req = mb[i];
             req->row_offset.resize(nrows + 1);
+            for (int fi = 0; fi < req->nfields; fi++)
+                req->field_out_offset[fi].resize(nrows);
+
+            // Pass A: compute sizes + field byte offsets within each row
             uint32_t off = 0;
             for (size_t r = 0; r < nrows; r++) {
                 req->row_offset[r] = off;
-                uint32_t rsz = 1; // newline
+                uint32_t fpos = 0;
                 for (int fi = 0; fi < req->nfields; fi++) {
-                    if (fi > 0) rsz++;
-                    if (req->is_sm4[fi])
-                        rsz += (uint32_t)g_sm4_pad[req->sm4idx[fi]].padlen[r] * 2u;
-                    else
-                        rsz += g_mask_outlen[req->maskidx[fi]][r];
+                    if (fi > 0) fpos++;  // comma
+                    req->field_out_offset[fi][r] = fpos;
+                    fpos += req->is_sm4[fi]
+                            ? (uint32_t)g_sm4_pad[req->sm4idx[fi]].padlen[r] * 2u
+                            : g_mask_outlen[req->maskidx[fi]][r];
                 }
-                off += rsz;
+                off += fpos + 1;  // +1 for newline
             }
             req->row_offset[nrows] = off;
             req->out_buf.resize(off);
+
+            // Pass B: fill structural characters (commas + newlines)
+            char* buf = req->out_buf.data();
+            for (size_t r = 0; r < nrows; r++) {
+                char* row = buf + req->row_offset[r];
+                for (int fi = 1; fi < req->nfields; fi++)
+                    row[req->field_out_offset[fi][r] - 1] = ',';
+                row[req->row_offset[r + 1] - req->row_offset[r] - 1] = '\n';
+            }
         });
 
-        // ── Phase 2: encrypt + mask, chunk-first task order ──────────────────
-        std::vector<CTask> ctasks;
-        ctasks.reserve(n_chunks * mb_sz);
-        for (size_t chunk = 0; chunk < n_chunks; chunk++) {
-            size_t rs = chunk * CHUNK_SIZE;
-            size_t re = std::min(rs + CHUNK_SIZE, nrows);
-            for (size_t i = 0; i < mb_sz; i++)
-                ctasks.push_back({mb[i], rs, re});
+        // ── Phase 2: field-level batch compute ───────────────────────────────
+        // Build per-field request lists (field-first = blob stays L1-hot)
+        // Arrays sized for max 7 SM4 + 4 mask fields; reqs/fi storage reused.
+        BatchReq* sm4_req_buf[7][MINI];
+        int       sm4_fi_buf [7][MINI];
+        size_t    sm4_cnt    [7] = {};
+        BatchReq* mask_req_buf[4][MINI];
+        int       mask_fi_buf [4][MINI];
+        size_t    mask_cnt   [4] = {};
+
+        for (size_t i = 0; i < mb_sz; i++) {
+            BatchReq* req = mb[i];
+            for (int fi = 0; fi < req->nfields; fi++) {
+                if (req->is_sm4[fi]) {
+                    int s = req->sm4idx[fi];
+                    sm4_req_buf[s][sm4_cnt[s]] = req;
+                    sm4_fi_buf [s][sm4_cnt[s]] = fi;
+                    sm4_cnt[s]++;
+                } else {
+                    int m = req->maskidx[fi];
+                    mask_req_buf[m][mask_cnt[m]] = req;
+                    mask_fi_buf [m][mask_cnt[m]] = fi;
+                    mask_cnt[m]++;
+                }
+            }
         }
-        submit_and_wait(ctasks.size(), [&](size_t i) {
-            compute_rows(ctasks[i].req, ctasks[i].rs, ctasks[i].re);
+
+        // Build task list: field-first, then chunk
+        struct FTask { bool is_sm4; int field_idx; size_t rs, re; };
+        std::vector<FTask> ftasks;
+        ftasks.reserve((7 + 4) * n_chunks);
+        for (int f = 0; f < 7; f++) {
+            if (!sm4_cnt[f]) continue;
+            for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+                size_t rs = chunk * CHUNK_SIZE;
+                ftasks.push_back({true,  f, rs, std::min(rs + CHUNK_SIZE, nrows)});
+            }
+        }
+        for (int f = 0; f < 4; f++) {
+            if (!mask_cnt[f]) continue;
+            for (size_t chunk = 0; chunk < n_chunks; chunk++) {
+                size_t rs = chunk * CHUNK_SIZE;
+                ftasks.push_back({false, f, rs, std::min(rs + CHUNK_SIZE, nrows)});
+            }
+        }
+        submit_and_wait(ftasks.size(), [&](size_t i) {
+            const FTask& t = ftasks[i];
+            FieldReqs fr;
+            if (t.is_sm4) {
+                fr = { sm4_req_buf[t.field_idx], sm4_fi_buf[t.field_idx],
+                       sm4_cnt[t.field_idx] };
+                compute_field_sm4(t.field_idx, t.rs, t.re, fr);
+            } else {
+                fr = { mask_req_buf[t.field_idx], mask_fi_buf[t.field_idx],
+                       mask_cnt[t.field_idx] };
+                compute_field_mask(t.field_idx, t.rs, t.re, fr);
+            }
         });
         auto t_mb_compute = tnow();
 
@@ -670,9 +741,11 @@ static void process_batch(std::vector<BatchReq*> batch) {
                 fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
                 fclose(fp);
             }
-            // Release output buffer now — don't wait until batch end
+            // Release output buffer and metadata now — don't wait until batch end
             std::string().swap(req->out_buf);
             std::vector<uint32_t>().swap(req->row_offset);
+            for (int fi = 0; fi < req->nfields; fi++)
+                std::vector<uint32_t>().swap(req->field_out_offset[fi]);
 
             double cb_ms = 0.0;
             if (!g_callback_url.empty() && g_callback_url != "skip") {
