@@ -716,7 +716,7 @@ static void process_batch(std::vector<BatchReq*> batch) {
 // ─── Batch collector ─────────────────────────────────────────────────────────
 //
 // Accumulates incoming /encrypt requests until we have g_coord_batch_size of
-// them, then fires process_batch(). Also has a 50 ms flush timeout so that
+// them, then fires process_batch(). Also has a 1000 ms flush timeout so that
 // small test runs (e.g. verify_sm4.sh, which sends only 1 request) don't wait
 // forever for a full batch that never comes.
 
@@ -727,7 +727,7 @@ static TPoint                  g_coord_first_time; // when first req of current 
 static bool                    g_coord_has_timer = false;
 
 // Timeout in ms: if the batch isn't full after this many ms, flush it anyway.
-static constexpr double COORD_TIMEOUT_MS = 50.0;
+static constexpr double COORD_TIMEOUT_MS = 1000.0;
 
 static void coord_add(BatchReq* req) {
     std::vector<BatchReq*> to_fire;
