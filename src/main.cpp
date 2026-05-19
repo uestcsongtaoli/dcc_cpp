@@ -716,29 +716,57 @@ static void process_batch(std::vector<BatchReq*> batch) {
 // ─── Batch collector ─────────────────────────────────────────────────────────
 //
 // Accumulates incoming /encrypt requests until we have g_coord_batch_size of
-// them, then the conn thread that fills the batch fires process_batch() inline.
-// Other conn threads return immediately after adding their request.
-//
-// For subsequent waves (if any), the collector resets automatically.
+// them, then fires process_batch(). Also has a 50 ms flush timeout so that
+// small test runs (e.g. verify_sm4.sh, which sends only 1 request) don't wait
+// forever for a full batch that never comes.
 
 static std::mutex              g_coord_mu;
 static std::vector<BatchReq*>  g_coord_pending;
 static int                     g_coord_batch_size = 100;
+static TPoint                  g_coord_first_time; // when first req of current batch arrived
+static bool                    g_coord_has_timer = false;
+
+// Timeout in ms: if the batch isn't full after this many ms, flush it anyway.
+static constexpr double COORD_TIMEOUT_MS = 50.0;
 
 static void coord_add(BatchReq* req) {
     std::vector<BatchReq*> to_fire;
     {
         std::lock_guard<std::mutex> lk(g_coord_mu);
+        if (!g_coord_has_timer) {
+            g_coord_first_time = tnow();
+            g_coord_has_timer  = true;
+        }
         g_coord_pending.push_back(req);
         if ((int)g_coord_pending.size() >= g_coord_batch_size) {
             to_fire = std::move(g_coord_pending);
             g_coord_pending.clear();
+            g_coord_has_timer = false;
         }
     }
-    // Only the thread that completes the batch runs process_batch.
-    // All other threads return immediately.
     if (!to_fire.empty())
         process_batch(std::move(to_fire));
+}
+
+// Timer thread: flush pending requests that have been waiting too long.
+static void coord_timer_loop() {
+    while (true) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        std::vector<BatchReq*> to_fire;
+        {
+            std::lock_guard<std::mutex> lk(g_coord_mu);
+            if (g_coord_has_timer && !g_coord_pending.empty()) {
+                double elapsed = tms(g_coord_first_time, tnow());
+                if (elapsed >= COORD_TIMEOUT_MS) {
+                    to_fire = std::move(g_coord_pending);
+                    g_coord_pending.clear();
+                    g_coord_has_timer = false;
+                }
+            }
+        }
+        if (!to_fire.empty())
+            process_batch(std::move(to_fire));
+    }
 }
 
 // ─── Connection handler ───────────────────────────────────────────────────────
@@ -840,6 +868,9 @@ int main() {
 
     g_work_pool = new ThreadPool(nw);
     g_conn_pool = new ThreadPool(nc);
+
+    // Batch flush timer (daemon thread — no join needed)
+    std::thread(coord_timer_loop).detach();
 
     int srv = socket(AF_INET, SOCK_STREAM, 0);
     int opt  = 1;
