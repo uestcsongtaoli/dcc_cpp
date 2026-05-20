@@ -1036,7 +1036,6 @@ static void handle_conn(int fd) {
     if (!read_http(fd, req)) { close(fd); return; }
 
     if (req.method == "GET" && req.path == "/health") {
-        ensure_csv();  // pre-load CSV so bench sees a warm server
         send_json(fd, 200, R"({"returnCode":"SUC0000","body": true,"errorMsg":""})");
 
     } else if (req.method == "POST" && req.path == "/encrypt") {
