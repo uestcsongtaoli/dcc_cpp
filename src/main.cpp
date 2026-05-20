@@ -130,11 +130,11 @@ static std::vector<uint16_t>    g_mask_outlen[4];  // byte length of each masked
 static uint16_t g_sm4_hex_fixed[7] = {};
 static uint16_t g_mask_len_fixed[4] = {};
 
-// Prefix sums for variable-output fields (size nrows+1; entry[0]=0).
-// g_bkey_prefix[r] = Σ_{s<r}  padlen[s]*2   (business_key hex chars, sm4idx=3)
-// g_name_prefix[r] = Σ_{s<r}  mask_outlen[s] (name mask bytes, maskidx=2)
-static std::vector<uint32_t> g_bkey_prefix;
-static std::vector<uint32_t> g_name_prefix;
+// Prefix sums for variable-output fields (size nrows+1; empty if field is fixed).
+// g_sm4_prefix[f][r] = cumulative hex-char count for SM4 field f, rows 0..r-1.
+// g_mask_prefix[m][r] = cumulative mask-byte count for mask field m, rows 0..r-1.
+static std::vector<uint32_t> g_sm4_prefix[7];
+static std::vector<uint32_t> g_mask_prefix[4];
 
 // Pre-computed PKCS7-padded plaintext blobs for the 7 SM4 fields.
 // Sequential memory instead of scattered std::string heap pointers →
@@ -234,17 +234,20 @@ static void load_csv() {
             if (g_mask_outlen[m][r] != l0) is_fixed = false;
         g_mask_len_fixed[m] = is_fixed ? l0 : 0u;
     }
-    // business_key (sm4idx=3): variable padlen → build hex-char prefix sum
-    if (g_sm4_hex_fixed[3] == 0) {
-        g_bkey_prefix.resize(g_nrows + 1, 0u);
-        for (size_t r = 0; r < g_nrows; r++)
-            g_bkey_prefix[r + 1] = g_bkey_prefix[r] + (uint32_t)g_sm4_pad[3].padlen[r] * 2u;
+    // Build prefix sums for every variable SM4 / mask field.
+    for (int f = 0; f < 7; f++) {
+        if (g_sm4_hex_fixed[f] == 0) {
+            g_sm4_prefix[f].resize(g_nrows + 1, 0u);
+            for (size_t r = 0; r < g_nrows; r++)
+                g_sm4_prefix[f][r+1] = g_sm4_prefix[f][r] + (uint32_t)g_sm4_pad[f].padlen[r] * 2u;
+        }
     }
-    // name (maskidx=2): variable mask length → build mask-byte prefix sum
-    if (g_mask_len_fixed[2] == 0) {
-        g_name_prefix.resize(g_nrows + 1, 0u);
-        for (size_t r = 0; r < g_nrows; r++)
-            g_name_prefix[r + 1] = g_name_prefix[r] + g_mask_outlen[2][r];
+    for (int m = 0; m < 4; m++) {
+        if (g_mask_len_fixed[m] == 0) {
+            g_mask_prefix[m].resize(g_nrows + 1, 0u);
+            for (size_t r = 0; r < g_nrows; r++)
+                g_mask_prefix[m][r+1] = g_mask_prefix[m][r] + g_mask_outlen[m][r];
+        }
     }
     auto t5 = tnow();
 
@@ -575,13 +578,12 @@ struct BatchReq {
     int  maskidx[11]= {};      // mask idx (0-3) or -1
 
     // Output layout metadata (replaces per-request 300K-row scan).
-    // fixed_row_bytes = bytes contributed per row by fixed-size fields + commas + newline.
-    // has_bkey / has_name = whether the variable-output fields are selected.
-    // Write position for row r: r*fixed_row_bytes + g_bkey_prefix[r] + g_name_prefix[r]
-    //   (prefix terms added only when the corresponding flag is set).
-    uint32_t fixed_row_bytes = 0;
-    bool     has_bkey = false;   // business_key selected (variable padlen)
-    bool     has_name = false;   // name selected (variable mask len)
+    // fixed_row_bytes: bytes per row from fixed-size fields + commas + newline.
+    // field_pfx[fi]: pointer into g_sm4_prefix[sidx] or g_mask_prefix[midx]
+    //   for variable-length fields; null if field fi produces fixed-length output.
+    // Write position for row r: r*fixed_row_bytes + Σ_{fi} field_pfx[fi][r]
+    uint32_t        fixed_row_bytes = 0;
+    const uint32_t* field_pfx[11]   = {};
 
     std::string out_buf;         // output buffer; allocated in Phase 1
 
@@ -631,13 +633,12 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
     char* base = req->out_buf.data();
 
     // O(1) row-start position using pre-built prefix sums (no row_offset array).
-    const uint32_t  fixed_rbs = req->fixed_row_bytes;
-    const uint32_t* bkey_pfx  = req->has_bkey ? g_bkey_prefix.data() : nullptr;
-    const uint32_t* name_pfx  = req->has_name ? g_name_prefix.data() : nullptr;
+    const uint32_t fixed_rbs  = req->fixed_row_bytes;
+    const int      nfields    = req->nfields;
     auto row_pos = [&](size_t r) -> uint32_t {
         uint32_t pos = (uint32_t)r * fixed_rbs;
-        if (bkey_pfx) pos += bkey_pfx[r];
-        if (name_pfx) pos += name_pfx[r];
+        for (int fi = 0; fi < nfields; fi++)
+            if (req->field_pfx[fi]) pos += req->field_pfx[fi][r];
         return pos;
     };
 
@@ -815,42 +816,45 @@ static void process_batch(std::vector<BatchReq*> batch) {
 
     // ── Phase 1: O(1) size computation + output buffer allocation ─────────────
     //
-    // Most SM4 fields have a fixed padlen for all rows (user_id, serial_no,
-    // user_code, device_id, trans_id, secret_code).  business_key is the only
-    // SM4 field with variable padlen.  Mask fields id_card, phone, email produce
-    // a fixed-length output; only name varies.
-    //
     // g_sm4_hex_fixed[f] and g_mask_len_fixed[m] are set in load_csv.
-    // g_bkey_prefix / g_name_prefix are their cumulative sums (size nrows+1).
+    // g_sm4_prefix[f] / g_mask_prefix[m] are their cumulative sums (size nrows+1);
+    // empty vectors if the field is fixed.
     //
     // Per-request total size = nrows*fixed_row_bytes
-    //                        + g_bkey_prefix[nrows]  (if business_key selected)
-    //                        + g_name_prefix[nrows]  (if name selected)
+    //                        + Σ_{fi: variable} field_pfx[fi][nrows]
     // No 300K-row loop needed.  Page faults from resize() happen here in Phase 1
     // (parallelized across compute workers) rather than lazily in Phase 2.
     submit_and_wait(batch.size(), [&](size_t i) {
         BatchReq* req = batch[i];
 
-        // Count fixed output bytes per row: commas + newline + fixed-field output.
+        // Count fixed output bytes per row; cache per-field prefix pointers.
         uint32_t fixed = 1;  // newline
         for (int fi = 0; fi < req->nfields; fi++) {
             if (fi > 0) fixed++;          // comma separator
             if (req->is_sm4[fi]) {
-                uint16_t h = g_sm4_hex_fixed[req->sm4idx[fi]];
-                if (h)   fixed += h;
-                else     req->has_bkey = true;  // sm4idx==3: business_key
+                int sidx = req->sm4idx[fi];
+                uint16_t h = g_sm4_hex_fixed[sidx];
+                if (h) {
+                    fixed += h;
+                } else {
+                    req->field_pfx[fi] = g_sm4_prefix[sidx].data();
+                }
             } else {
-                uint16_t m = g_mask_len_fixed[req->maskidx[fi]];
-                if (m)   fixed += m;
-                else     req->has_name = true;  // maskidx==2: name
+                int midx = req->maskidx[fi];
+                uint16_t m = g_mask_len_fixed[midx];
+                if (m) {
+                    fixed += m;
+                } else {
+                    req->field_pfx[fi] = g_mask_prefix[midx].data();
+                }
             }
         }
         req->fixed_row_bytes = fixed;
 
         // O(1) total output size via global prefix sums.
         uint32_t total = (uint32_t)nrows * fixed;
-        if (req->has_bkey) total += g_bkey_prefix[nrows];
-        if (req->has_name) total += g_name_prefix[nrows];
+        for (int fi = 0; fi < req->nfields; fi++)
+            if (req->field_pfx[fi]) total += req->field_pfx[fi][nrows];
 
         // Allocate.  std::string::resize zero-inits → page faults triggered here,
         // parallelized across all compute workers, not serialized in Phase 2.
