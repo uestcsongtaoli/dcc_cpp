@@ -43,7 +43,94 @@ static void sm4_ecb_x16(const SM4Ctx& ctx, __m512i st[4]) {
     st[0]=X3; st[1]=X2; st[2]=X1; st[3]=X0;
 }
 
-// ── nopad variant ─────────────────────────────────────────────────────────────
+// ── x32: two interleaved ZMM groups ──────────────────────────────────────────
+//
+// Processes 32 independent SM4 blocks simultaneously.
+// Group A = chains  0-15  (stA[0..3])
+// Group B = chains 16-31  (stB[0..3])
+//
+// Within each round, both groups' T_enc_x16 calls are fully independent →
+// the CPU's OOO engine can issue gathers from both groups simultaneously,
+// hiding the ~18-cycle gather latency behind the other group's computation.
+// This doubles effective gather throughput per thread vs. the x16 path.
+static void sm4_ecb_x32(const SM4Ctx& ctx, __m512i stA[4], __m512i stB[4]) {
+    __m512i XA0=stA[0], XA1=stA[1], XA2=stA[2], XA3=stA[3];
+    __m512i XB0=stB[0], XB1=stB[1], XB2=stB[2], XB3=stB[3];
+    for (int i = 0; i < 32; ++i) {
+        __m512i rk  = _mm512_set1_epi32(ctx.rk[i]);
+        __m512i inA = _mm512_xor_epi32(_mm512_xor_epi32(XA1, XA2),
+                                        _mm512_xor_epi32(XA3, rk));
+        __m512i inB = _mm512_xor_epi32(_mm512_xor_epi32(XB1, XB2),
+                                        _mm512_xor_epi32(XB3, rk));
+        // Both T_enc_x16 calls are independent — issuer can pipeline their
+        // 4 gathers each (8 gathers total in flight per round).
+        __m512i nxA = _mm512_xor_epi32(XA0, T_enc_x16(inA));
+        __m512i nxB = _mm512_xor_epi32(XB0, T_enc_x16(inB));
+        XA0=XA1; XA1=XA2; XA2=XA3; XA3=nxA;
+        XB0=XB1; XB1=XB2; XB2=XB3; XB3=nxB;
+    }
+    stA[0]=XA3; stA[1]=XA2; stA[2]=XA1; stA[3]=XA0;
+    stB[0]=XB3; stB[1]=XB2; stB[2]=XB1; stB[3]=XB0;
+}
+
+// ── nopad variant (x32) ───────────────────────────────────────────────────────
+// Like sm4_cbc_encrypt_x16_nopad but processes 32 chains.
+// pt[0..31] must point to already-PKCS7-padded data.
+// ct_len[i] must be a multiple of 16.
+void sm4_cbc_encrypt_x32_nopad(
+    const SM4Ctx&        ctx,
+    const uint8_t        iv[16],
+    const uint8_t* const pt[32],
+    const size_t         ct_len[32],
+    uint8_t* const       ct[32])
+{
+    size_t max_total = 0;
+    for (int i = 0; i < 32; ++i)
+        if (ct_len[i] > max_total) max_total = ct_len[i];
+    if (max_total == 0) return;
+
+    uint32_t iv_w[4];
+    for (int j = 0; j < 4; ++j) iv_w[j] = load_be32(iv + j*4);
+
+    // CBC carry for both groups, stored column-major [word][chain].
+    alignas(64) uint32_t prevA[4][16];
+    alignas(64) uint32_t prevB[4][16];
+    for (int j = 0; j < 4; ++j)
+        for (int i = 0; i < 16; ++i)
+            prevA[j][i] = prevB[j][i] = iv_w[j];
+
+    alignas(64) uint32_t colA[16], colB[16];
+    alignas(64) uint32_t ctA[16],  ctB[16];
+
+    for (size_t off = 0; off < max_total; off += 16) {
+        __m512i stA[4], stB[4];
+        for (int j = 0; j < 4; ++j) {
+            for (int i = 0; i < 16; ++i) {
+                uint32_t ptA = (off < ct_len[i   ]) ? load_be32(pt[i   ] + off + j*4) : 0u;
+                uint32_t ptB = (off < ct_len[i+16]) ? load_be32(pt[i+16] + off + j*4) : 0u;
+                colA[i] = ptA ^ prevA[j][i];
+                colB[i] = ptB ^ prevB[j][i];
+            }
+            stA[j] = _mm512_load_si512((const __m512i*)colA);
+            stB[j] = _mm512_load_si512((const __m512i*)colB);
+        }
+
+        sm4_ecb_x32(ctx, stA, stB);
+
+        for (int j = 0; j < 4; ++j) {
+            _mm512_store_si512((__m512i*)ctA, stA[j]);
+            _mm512_store_si512((__m512i*)ctB, stB[j]);
+            for (int i = 0; i < 16; ++i) {
+                prevA[j][i] = ctA[i];
+                prevB[j][i] = ctB[i];
+                if (off < ct_len[i   ]) store_be32(ct[i   ] + off + j*4, ctA[i]);
+                if (off < ct_len[i+16]) store_be32(ct[i+16] + off + j*4, ctB[i]);
+            }
+        }
+    }
+}
+
+// ── nopad variant (x16) ───────────────────────────────────────────────────────
 // Inputs are already PKCS7-padded.  Reads directly from pt[i] — no staging copy.
 // ct_len[i] must be a multiple of 16.
 void sm4_cbc_encrypt_x16_nopad(

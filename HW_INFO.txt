@@ -1,0 +1,23 @@
+[HW] Vendor: GenuineIntel  max_leaf=0x16
+[HW] Brand:  Intel(R) Xeon(R) Gold 5218 CPU @ 2.30GHz
+[HW] Family=0x06  Model=0x55  Stepping=7  LogicalPerPkg(CPUID1)=4
+[HW] Extended topology (CPUID 0xB):
+[HW]   sub=0  type=SMT/thread  logical_count=2  x2APIC=0
+[HW]   sub=1  type=Core        logical_count=4  x2APIC=0
+[HW] Cache topology (CPUID leaf 4):
+[HW]   L1-Data         32 KB  ways=  8  sets=   64  line=64 B  parts=1  shared= 2  inclusive=0
+[HW]   L1-Instr        32 KB  ways=  8  sets=   64  line=64 B  parts=1  shared= 2  inclusive=0
+[HW]   L2-Unified    1024 KB  ways= 16  sets= 1024  line=64 B  parts=1  shared= 2  inclusive=0
+[HW]   L3-Unified   22528 KB  ways= 11  sets=32768  line=64 B  parts=1  shared= 4  inclusive=0
+[HW] AVX-512: F=1  DQ=1  BW=1  VL=1  CD=1  IFMA=0  VNNI=1  VBMI=0  VBMI2=0  BITALG=0  VPOPCNTDQ=0
+[HW] Other:   AVX2=1  BMI1=1  BMI2=1  ERMS=1  CLFLUSHOPT=1  CLWB=1  SHA=0
+[HW] Leaf1:   SSE4.1=1  SSE4.2=1  AVX=1  AES=1  PCLMUL=1  POPCNT=1  RDRAND=1
+[HW] /proc/cpuinfo: logical_cpus=4  sockets=1  cores_per_socket=2  MHz min=2300 max=2300
+[HW] MemTotal:        8008204 kB
+[HW] MemFree:         5067708 kB
+[HW] HugePages_Total:       0
+[HW] Hugepagesize:       2048 kB
+[HW] NUMA nodes online: 0
+[HW] CPUs online: 0-3
+[HW] CPU governor: performance
+[HW] std::thread::hardware_concurrency = 4

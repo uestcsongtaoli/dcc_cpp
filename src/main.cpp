@@ -34,9 +34,46 @@ static std::string g_output_dir;
 static std::string g_team_code;
 static std::string g_callback_url;
 static bool        g_debug      = false;
+static bool        g_profile    = false;   // DCC_PROFILE=1 → per-phase RDTSC breakdown
 static int         g_port       = 8080;
-static int         g_workers    = 0;
+static int         g_workers         = 0;   // compute (DCC_WORKERS / DCC_COMPUTE_WORKERS)
+static int         g_write_workers   = 16;  // DCC_WRITE_WORKERS
+static int         g_cb_workers      = 8;   // DCC_CALLBACK_WORKERS
 static int         g_expect_reqs= 100;
+static int         g_sm4_mode   = 16;      // DCC_SM4_MODE: 0=scalar, 16=x16 (default), 32=x32
+
+// ─── Compute profiling (DCC_PROFILE=1) ────────────────────────────────────────
+//
+// Per-section RDTSC cycle counts, accumulated from all compute threads.
+// Reported as percentages at end of [BATCH_PHASES].  Zero overhead when
+// g_profile == false (all RDTSC calls are inside "if (g_profile)" branches
+// that are perfectly branch-predicted as not-taken).
+
+static inline uint64_t rdtsc() { return __builtin_ia32_rdtsc(); }
+
+static std::atomic<uint64_t> g_cyc_sm4{0};    // inside sm4_cbc_encrypt_x*_nopad
+static std::atomic<uint64_t> g_cyc_hex{0};    // inside hex_encode loop
+static std::atomic<uint64_t> g_cyc_mask{0};   // inside mask memcpy loop
+static std::atomic<uint64_t> g_cyc_other{0};  // everything else in compute_rows
+
+static void profile_reset() {
+    g_cyc_sm4.store(0); g_cyc_hex.store(0);
+    g_cyc_mask.store(0); g_cyc_other.store(0);
+}
+static void profile_log(double wall_ms) {
+    uint64_t sm4  = g_cyc_sm4.load();
+    uint64_t hex  = g_cyc_hex.load();
+    uint64_t mask = g_cyc_mask.load();
+    uint64_t oth  = g_cyc_other.load();
+    uint64_t tot  = sm4 + hex + mask + oth;
+    if (tot == 0) return;
+    auto pct = [&](uint64_t v) { return v * 100.0 / tot; };
+    fprintf(stderr,
+        "[PROFILE] wall=%.0fms  SM4=%.1f%%  hex=%.1f%%  mask=%.1f%%  other=%.1f%%"
+        "  (cyc: sm4=%zu hex=%zu mask=%zu oth=%zu)\n",
+        wall_ms, pct(sm4), pct(hex), pct(mask), pct(oth),
+        (size_t)sm4, (size_t)hex, (size_t)mask, (size_t)oth);
+}
 
 // ─── Timing ───────────────────────────────────────────────────────────────────
 
@@ -238,8 +275,10 @@ public:
     }
 };
 
-static ThreadPool* g_work_pool = nullptr;
-static ThreadPool* g_conn_pool = nullptr;
+static ThreadPool* g_compute_pool = nullptr;  // CPU-bound SM4/mask
+static ThreadPool* g_write_pool   = nullptr;  // file I/O
+static ThreadPool* g_cb_pool      = nullptr;  // HTTP callbacks
+static ThreadPool* g_conn_pool    = nullptr;  // incoming connections
 
 // ─── Batch timing ─────────────────────────────────────────────────────────────
 
@@ -492,8 +531,8 @@ struct BatchReq {
 };
 
 // ─── submit_and_wait helper ───────────────────────────────────────────────────
-// Submit `count` tasks fn(0)..fn(count-1) to g_work_pool and block until all
-// complete.  Must NOT be called from a g_work_pool thread (would deadlock).
+// Submit `count` tasks fn(0)..fn(count-1) to g_compute_pool and block until all
+// complete.  Must NOT be called from a g_compute_pool thread (would deadlock).
 
 static void submit_and_wait(size_t count, std::function<void(size_t)> fn) {
     if (count == 0) return;
@@ -503,7 +542,7 @@ static void submit_and_wait(size_t count, std::function<void(size_t)> fn) {
     bool                    all_done = false;
 
     for (size_t i = 0; i < count; i++) {
-        g_work_pool->submit([&, i]() {
+        g_compute_pool->submit([&, i]() {
             fn(i);
             if (--remaining == 0) {
                 std::lock_guard<std::mutex> lk(m);
@@ -517,89 +556,182 @@ static void submit_and_wait(size_t count, std::function<void(size_t)> fn) {
 }
 
 // ─── Per-request row-range compute ───────────────────────────────────────────
+//
+// g_sm4_mode selects the SIMD width for the hot AVX-512 path:
+//   0  = pure scalar (baseline / regression check)
+//  16  = x16 (default): 16 rows per SM4 batch (one ZMM group)
+//  32  = x32: 32 rows per SM4 batch (two interleaved ZMM groups to hide gather latency)
+//
+// g_profile=true: accumulates RDTSC cycle counts per section into global atomics.
+// g_profile=false: the RDTSC calls are inside never-taken "if (g_profile)" branches
+// → zero throughput overhead (branch predictor saturates immediately).
 
 static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
     if (row_start >= row_end) return;
 
-    constexpr size_t B = 16;
     char* base = req->out_buf.data();
 
-    // Ciphertext staging (stack): max 4 SM4 blocks = 64 bytes per chain
-    alignas(64) uint8_t ct_s[B][64];
-    const uint8_t* pt_p[B];
-    size_t         ct_l[B];
-    uint8_t*       ct_p[B];
-    for (size_t b = 0; b < B; b++) ct_p[b] = ct_s[b];
+    // Thread-local profiling accumulators.  Flushed to globals at end.
+    uint64_t p_sm4 = 0, p_hex = 0, p_mask = 0, p_other = 0;
 
-    const size_t full = row_start + ((row_end - row_start) / B) * B;
+    // ── x32 path (B=32, two interleaved ZMM groups) ───────────────────────────
+    if (g_sm4_mode == 32) {
+        constexpr size_t B = 32;
+        alignas(64) uint8_t ct_s[B][64];
+        const uint8_t* pt_p[B];
+        size_t         ct_l[B];
+        uint8_t*       ct_p[B];
+        for (size_t b = 0; b < B; b++) ct_p[b] = ct_s[b];
 
-    // ── x16 AVX-512 path ─────────────────────────────────────────────────────
-    for (size_t base_row = row_start; base_row < full; base_row += B) {
-        char* wp[B];
-        for (size_t b = 0; b < B; b++)
-            wp[b] = base + req->row_offset[base_row + b];
+        const size_t full32 = row_start + ((row_end - row_start) / B) * B;
 
-        for (int fi = 0; fi < req->nfields; fi++) {
-            if (fi > 0)
-                for (size_t b = 0; b < B; b++) *wp[b]++ = ',';
+        for (size_t base_row = row_start; base_row < full32; base_row += B) {
+            char* wp[B];
+            uint64_t t0, t1;
+            if (g_profile) t0 = rdtsc();
+            for (size_t b = 0; b < B; b++)
+                wp[b] = base + req->row_offset[base_row + b];
+            if (g_profile) { t1 = rdtsc(); p_other += t1 - t0; }
 
-            if (req->is_sm4[fi]) {
-                int sidx = req->sm4idx[fi];
-                const SM4PaddedField& spf = g_sm4_pad[sidx];
-                for (size_t b = 0; b < B; b++) {
-                    size_t r = base_row + b;
-                    pt_p[b] = spf.blob.data() + spf.offset[r];
-                    ct_l[b] = spf.padlen[r];
-                }
-                sm4_cbc_encrypt_x16_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
-                for (size_t b = 0; b < B; b++) {
-                    if (ct_l[b] == 0) continue;
-                    hex_encode(ct_s[b], wp[b], ct_l[b]);
-                    wp[b] += ct_l[b] * 2;
-                }
-            } else {
-                int midx = req->maskidx[fi];
-                for (size_t b = 0; b < B; b++) {
-                    size_t r = base_row + b;
-                    const std::string& m = g_masked_col[midx][r];
-                    memcpy(wp[b], m.data(), m.size());
-                    wp[b] += m.size();
+            for (int fi = 0; fi < req->nfields; fi++) {
+                if (fi > 0)
+                    for (size_t b = 0; b < B; b++) *wp[b]++ = ',';
+
+                if (req->is_sm4[fi]) {
+                    int sidx = req->sm4idx[fi];
+                    const SM4PaddedField& spf = g_sm4_pad[sidx];
+                    for (size_t b = 0; b < B; b++) {
+                        size_t r = base_row + b;
+                        pt_p[b] = spf.blob.data() + spf.offset[r];
+                        ct_l[b] = spf.padlen[r];
+                    }
+                    if (g_profile) t0 = rdtsc();
+                    sm4_cbc_encrypt_x32_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+                    if (g_profile) { t1 = rdtsc(); p_sm4 += t1 - t0; t0 = t1; }
+                    for (size_t b = 0; b < B; b++) {
+                        if (ct_l[b] == 0) continue;
+                        hex_encode(ct_s[b], wp[b], ct_l[b]);
+                        wp[b] += ct_l[b] * 2;
+                    }
+                    if (g_profile) { t1 = rdtsc(); p_hex += t1 - t0; }
+                } else {
+                    int midx = req->maskidx[fi];
+                    if (g_profile) t0 = rdtsc();
+                    for (size_t b = 0; b < B; b++) {
+                        size_t r = base_row + b;
+                        const std::string& m = g_masked_col[midx][r];
+                        memcpy(wp[b], m.data(), m.size());
+                        wp[b] += m.size();
+                    }
+                    if (g_profile) { t1 = rdtsc(); p_mask += t1 - t0; }
                 }
             }
+            for (size_t b = 0; b < B; b++) *wp[b] = '\n';
         }
-        for (size_t b = 0; b < B; b++) *wp[b] = '\n';
+        // Remainder handled by the x16 loop below (fall through).
+        row_start = full32;
     }
 
-    // ── scalar remainder (last nrows % 16 rows) ───────────────────────────────
-    for (size_t r = full; r < row_end; r++) {
+    // ── x16 AVX-512 path (default) ───────────────────────────────────────────
+    if (g_sm4_mode >= 16) {
+        constexpr size_t B = 16;
+        alignas(64) uint8_t ct_s[B][64];
+        const uint8_t* pt_p[B];
+        size_t         ct_l[B];
+        uint8_t*       ct_p[B];
+        for (size_t b = 0; b < B; b++) ct_p[b] = ct_s[b];
+
+        const size_t full = row_start + ((row_end - row_start) / B) * B;
+
+        for (size_t base_row = row_start; base_row < full; base_row += B) {
+            char* wp[B];
+            uint64_t t0, t1;
+            if (g_profile) t0 = rdtsc();
+            for (size_t b = 0; b < B; b++)
+                wp[b] = base + req->row_offset[base_row + b];
+            if (g_profile) { t1 = rdtsc(); p_other += t1 - t0; }
+
+            for (int fi = 0; fi < req->nfields; fi++) {
+                if (fi > 0)
+                    for (size_t b = 0; b < B; b++) *wp[b]++ = ',';
+
+                if (req->is_sm4[fi]) {
+                    int sidx = req->sm4idx[fi];
+                    const SM4PaddedField& spf = g_sm4_pad[sidx];
+                    for (size_t b = 0; b < B; b++) {
+                        size_t r = base_row + b;
+                        pt_p[b] = spf.blob.data() + spf.offset[r];
+                        ct_l[b] = spf.padlen[r];
+                    }
+                    if (g_profile) t0 = rdtsc();
+                    sm4_cbc_encrypt_x16_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+                    if (g_profile) { t1 = rdtsc(); p_sm4 += t1 - t0; t0 = t1; }
+                    for (size_t b = 0; b < B; b++) {
+                        if (ct_l[b] == 0) continue;
+                        hex_encode(ct_s[b], wp[b], ct_l[b]);
+                        wp[b] += ct_l[b] * 2;
+                    }
+                    if (g_profile) { t1 = rdtsc(); p_hex += t1 - t0; }
+                } else {
+                    int midx = req->maskidx[fi];
+                    if (g_profile) t0 = rdtsc();
+                    for (size_t b = 0; b < B; b++) {
+                        size_t r = base_row + b;
+                        const std::string& m = g_masked_col[midx][r];
+                        memcpy(wp[b], m.data(), m.size());
+                        wp[b] += m.size();
+                    }
+                    if (g_profile) { t1 = rdtsc(); p_mask += t1 - t0; }
+                }
+            }
+            for (size_t b = 0; b < B; b++) *wp[b] = '\n';
+        }
+        row_start = full;
+    }
+
+    // ── scalar remainder (last <16 rows, also handles g_sm4_mode==0 entirely) ─
+    for (size_t r = row_start; r < row_end; r++) {
         char* p = base + req->row_offset[r];
+        uint64_t t0, t1;
         for (int fi = 0; fi < req->nfields; fi++) {
             if (fi > 0) *p++ = ',';
             if (req->is_sm4[fi]) {
                 int sidx = req->sm4idx[fi];
-                // Use original plaintext from g_cols for scalar path
                 const std::string& val = g_cols[SM4IDX_TO_COL[sidx]][r];
                 if (!val.empty()) {
                     uint8_t ct[64];
+                    if (g_profile) t0 = rdtsc();
                     size_t cl = sm4_cbc_encrypt_into(req->ctx, SM4_IV,
                         (const uint8_t*)val.data(), val.size(), ct);
+                    if (g_profile) { t1 = rdtsc(); p_sm4 += t1 - t0; t0 = t1; }
                     hex_encode(ct, p, cl);
+                    if (g_profile) { t1 = rdtsc(); p_hex += t1 - t0; }
                     p += cl * 2;
                 }
             } else {
                 int midx = req->maskidx[fi];
                 const std::string& m = g_masked_col[midx][r];
+                if (g_profile) t0 = rdtsc();
                 memcpy(p, m.data(), m.size());
+                if (g_profile) { t1 = rdtsc(); p_mask += t1 - t0; }
                 p += m.size();
             }
         }
         *p = '\n';
     }
+
+    // Flush thread-local accumulators to globals (relaxed: ordering doesn't matter).
+    if (g_profile) {
+        g_cyc_sm4.fetch_add(p_sm4,   std::memory_order_relaxed);
+        g_cyc_hex.fetch_add(p_hex,   std::memory_order_relaxed);
+        g_cyc_mask.fetch_add(p_mask, std::memory_order_relaxed);
+        g_cyc_other.fetch_add(p_other, std::memory_order_relaxed);
+    }
 }
 
 // ─── Batch processor ──────────────────────────────────────────────────────────
 //
-// Called ONCE per batch from a conn-pool thread (never g_work_pool).
+// Called ONCE per batch from a conn-pool thread (never g_compute_pool).
 //
 // Phase 1: parallel pre-computation of row_offset[] + out_buf allocation.
 // Phase 2: encrypt+mask all rows, chunk-first task ordering for L3 cache reuse.
@@ -654,54 +786,85 @@ static void process_batch(std::vector<BatchReq*> batch) {
         for (auto* req : batch)
             ctasks.push_back({req, rs, re});
     }
+    if (g_profile) profile_reset();
     submit_and_wait(ctasks.size(), [&](size_t i) {
         compute_rows(ctasks[i].req, ctasks[i].rs, ctasks[i].re);
     });
     auto t_compute = tnow();
+    if (g_profile) profile_log(tms(t_alloc, t_compute));
 
-    // ── Phase 3: write files + callbacks ─────────────────────────────────────
+    // ── Phase 3: write → callback pipeline (write_pool → cb_pool) ───────────
+    //
+    // compute_pool is NOT used here: write_pool handles fwrite, cb_pool handles
+    // HTTP POSTs.  Both are independent of compute so the next batch (if any)
+    // can start compute immediately while I/O and network calls drain.
+    //
+    // process_batch blocks on ph3_remaining so batch lifetime and [BATCH_PHASES]
+    // logging remain correct; the blocking happens on a conn-pool thread (not a
+    // compute thread), so there is no deadlock risk.
     std::filesystem::create_directories(g_output_dir);
 
-    submit_and_wait(batch.size(), [&](size_t i) {
-        BatchReq* req = batch[i];
-        auto t_enc_end = tnow();
+    std::atomic<int>        ph3_remaining((int)batch.size());
+    std::mutex              ph3_mu;
+    std::condition_variable ph3_cv;
 
-        FILE* fp = fopen(req->out_path.c_str(), "wb");
-        if (fp) {
-            fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
-            fclose(fp);
-        }
-        auto t_wr = tnow();
+    for (size_t i = 0; i < batch.size(); i++) {
+        g_write_pool->submit([&, i]() {
+            BatchReq* req = batch[i];
 
-        double cb_ms = 0.0;
-        if (!g_callback_url.empty() && g_callback_url != "skip") {
-            auto t_cb0 = tnow();
-            std::string cb =
-                "{\"teamCode\":\"" + g_team_code + "\","
-                "\"requestId\":\"" + req->request_id + "\","
-                "\"ip\":\"" + req->ip + "\"}";
-            for (int retry = 0; retry < 5; retry++) {
-                if (http_post(g_callback_url, cb)) break;
-                usleep(50000);
+            FILE* fp = fopen(req->out_path.c_str(), "wb");
+            if (fp) {
+                fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
+                fclose(fp);
             }
-            cb_ms = tms(t_cb0, tnow());
-        }
+            double d_wr = tms(t_compute, tnow());
 
-        double d_total = tms(req->t_req_start, tnow());
-        double d_enc   = tms(t_batch, t_compute);  // shared batch compute time
-        double d_wr    = tms(t_enc_end, t_wr);
-        double d_wall  = batch_wall_ms();
-        int    done    = g_req_done.load() + 1;
-        int    subm    = g_req_submitted.load();
+            // After write completes, hand off to cb_pool.
+            // Capture req and d_wr by value (local to this lambda frame).
+            // t_batch / t_compute / ph3_* captured by ref from process_batch
+            // scope — safe because process_batch blocks until ph3_remaining==0.
+            g_cb_pool->submit([&, req, d_wr]() {
+                double cb_ms = 0.0;
+                if (!g_callback_url.empty() && g_callback_url != "skip") {
+                    auto t_cb0 = tnow();
+                    std::string cb =
+                        "{\"teamCode\":\"" + g_team_code + "\","
+                        "\"requestId\":\"" + req->request_id + "\","
+                        "\"ip\":\"" + req->ip + "\"}";
+                    for (int retry = 0; retry < 5; retry++) {
+                        if (http_post(g_callback_url, cb)) break;
+                        usleep(50000);
+                    }
+                    cb_ms = tms(t_cb0, tnow());
+                }
 
-        fprintf(stderr,
-            "[DONE] %-28s [%3d/%-3d]  req=%7.1fms  wall=%7.1fms"
-            "  enc=%6.1f  wr=%5.2f  cb=%5.1f\n",
-            req->request_id.c_str(), done, subm,
-            d_total, d_wall, d_enc, d_wr, cb_ms);
+                double d_total = tms(req->t_req_start, tnow());
+                double d_enc   = tms(t_batch, t_compute);
+                double d_wall  = batch_wall_ms();
+                int    subm    = g_req_submitted.load();
 
-        batch_req_done(d_total, d_enc, cb_ms);
-    });
+                batch_req_done(d_total, d_enc, cb_ms);
+                int done = g_req_done.load();
+
+                fprintf(stderr,
+                    "[DONE] %-28s [%3d/%-3d]  req=%7.1fms  wall=%7.1fms"
+                    "  enc=%6.1f  wr=%5.2f  cb=%5.1f\n",
+                    req->request_id.c_str(), done, subm,
+                    d_total, d_wall, d_enc, d_wr, cb_ms);
+
+                if (--ph3_remaining == 0) {
+                    std::lock_guard<std::mutex> lk(ph3_mu);
+                    ph3_cv.notify_all();
+                }
+            });
+        });
+    }
+
+    // Block until every write+callback in this batch has completed.
+    {
+        std::unique_lock<std::mutex> lk(ph3_mu);
+        ph3_cv.wait(lk, [&]{ return ph3_remaining.load() == 0; });
+    }
 
     auto t_end = tnow();
     fprintf(stderr,
@@ -842,32 +1005,48 @@ int main() {
     g_output_dir   = env("DCC_OUTPUT_DIR",  "/opt/app/dcc/baseline/output/");
     g_team_code    = env("DCC_TEAM_CODE",   "baseline");
     g_callback_url = env("DCC_CALLBACK_URL","http://dcc08-data-encrypt.paas.cmbchina.cn/callback");
-    g_debug        = (env("DCC_DEBUG",     "0") == "1");
+    g_debug        = (env("DCC_DEBUG",   "0") == "1");
+    g_profile      = (env("DCC_PROFILE", "0") == "1");
+    g_sm4_mode     = std::stoi(env("DCC_SM4_MODE", "16"));  // 0=scalar 16=x16 32=x32
     g_expect_reqs  = std::stoi(env("DCC_EXPECT_REQS", "100"));
     g_port         = std::stoi(env("DCC_PORT",         "8080"));
-    g_workers      = std::stoi(env("DCC_WORKERS",      "0"));
+    // DCC_COMPUTE_WORKERS takes priority; DCC_WORKERS kept for backward compat.
+    {
+        const char* cw = getenv("DCC_COMPUTE_WORKERS");
+        g_workers = std::stoi(cw ? cw : env("DCC_WORKERS", "0"));
+    }
+    g_write_workers = std::stoi(env("DCC_WRITE_WORKERS",    "16"));
+    g_cb_workers    = std::stoi(env("DCC_CALLBACK_WORKERS", "8"));
 
     if (!g_output_dir.empty() && g_output_dir.back() != '/')
         g_output_dir += '/';
 
     signal(SIGPIPE, SIG_IGN);
 
-    unsigned nw = (g_workers > 0)
-                  ? (unsigned)g_workers
-                  : std::thread::hardware_concurrency();
-    if (nw < 1) nw = 1;
+    unsigned ncompute = (g_workers > 0)
+                        ? (unsigned)g_workers
+                        : std::thread::hardware_concurrency();
+    if (ncompute < 1) ncompute = 1;
+    if (g_write_workers  < 1) g_write_workers  = 1;
+    if (g_cb_workers     < 1) g_cb_workers     = 1;
     unsigned nc = 64;
 
     g_coord_batch_size = (g_expect_reqs > 0) ? g_expect_reqs : 100;
 
-    std::cerr << "[INFO] Workers: " << nw << "  Conn pool: " << nc
+    std::cerr << "[INFO] Compute: " << ncompute
+              << "  Write: "   << g_write_workers
+              << "  CB: "      << g_cb_workers
+              << "  Conn: "    << nc
               << "  BatchSize: " << g_coord_batch_size
-              << "  AVX-512: ON"
+              << "  SM4mode: x" << g_sm4_mode
+              << (g_profile ? "  PROFILE:ON" : "")
               << "  CSV: " << g_csv_path
               << "  Out: " << g_output_dir << "\n";
 
-    g_work_pool = new ThreadPool(nw);
-    g_conn_pool = new ThreadPool(nc);
+    g_compute_pool = new ThreadPool(ncompute);
+    g_write_pool   = new ThreadPool((unsigned)g_write_workers);
+    g_cb_pool      = new ThreadPool((unsigned)g_cb_workers);
+    g_conn_pool    = new ThreadPool(nc);
 
     // Batch flush timer (daemon thread — no join needed)
     std::thread(coord_timer_loop).detach();
