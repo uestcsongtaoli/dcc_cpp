@@ -16,6 +16,8 @@
 #include <cstdio>
 #include <chrono>
 #include <filesystem>
+#include <sys/mman.h>
+#include <fcntl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -481,10 +483,12 @@ struct BatchReq {
     int  sm4idx[11] = {};      // SM4 field idx (0-6) or -1
     int  maskidx[11]= {};      // mask idx (0-3) or -1
 
-    // Pre-allocated output buffer.
-    // row_offset[r] = byte offset of row r in out_buf.
+    // mmap-backed output file.
+    // row_offset[r] = byte offset of row r in the mapped region.
     // row_offset[nrows] = total size.
-    std::string              out_buf;
+    char*                    out_ptr   = nullptr;
+    size_t                   out_size  = 0;
+    int                      out_fd    = -1;
     std::vector<uint32_t>    row_offset;
 
     std::string out_path;
@@ -522,7 +526,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
     if (row_start >= row_end) return;
 
     constexpr size_t B = 16;
-    char* base = req->out_buf.data();
+    char* base = req->out_ptr;
 
     // Ciphertext staging (stack): max 4 SM4 blocks = 64 bytes per chain
     alignas(64) uint8_t ct_s[B][64];
@@ -601,7 +605,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 //
 // Called ONCE per batch from a conn-pool thread (never g_work_pool).
 //
-// Phase 1: parallel pre-computation of row_offset[] + out_buf allocation.
+// Phase 1: parallel pre-computation of row_offset[] + mmap output file.
 // Phase 2: encrypt+mask all rows, chunk-first task ordering for L3 cache reuse.
 // Phase 3: write output files + callbacks.
 
@@ -611,7 +615,9 @@ static void process_batch(std::vector<BatchReq*> batch) {
     const size_t nrows = g_nrows;
     ensure_csv();
 
-    // ── Phase 1: row offsets + output buffer allocation ───────────────────────
+    std::filesystem::create_directories(g_output_dir);
+
+    // ── Phase 1: row offsets + mmap output file ───────────────────────────────
     submit_and_wait(batch.size(), [&](size_t i) {
         BatchReq* req = batch[i];
         req->row_offset.resize(nrows + 1);
@@ -629,7 +635,21 @@ static void process_batch(std::vector<BatchReq*> batch) {
             off += rsz;
         }
         req->row_offset[nrows] = off;
-        req->out_buf.resize(off);
+        req->out_size = off;
+        if (off > 0) {
+            int fd2 = open(req->out_path.c_str(), O_RDWR | O_CREAT | O_TRUNC, 0644);
+            if (fd2 >= 0) {
+                ftruncate(fd2, (off_t)off);
+                void* p = mmap(nullptr, off, PROT_READ | PROT_WRITE, MAP_SHARED, fd2, 0);
+                if (p != MAP_FAILED) {
+                    madvise(p, off, MADV_SEQUENTIAL);
+                    req->out_ptr = static_cast<char*>(p);
+                    req->out_fd  = fd2;
+                } else {
+                    close(fd2);
+                }
+            }
+        }
     });
     auto t_alloc = tnow();
 
@@ -659,17 +679,18 @@ static void process_batch(std::vector<BatchReq*> batch) {
     });
     auto t_compute = tnow();
 
-    // ── Phase 3: write files + callbacks ─────────────────────────────────────
-    std::filesystem::create_directories(g_output_dir);
-
+    // ── Phase 3: flush mmap + callbacks ──────────────────────────────────────
     submit_and_wait(batch.size(), [&](size_t i) {
         BatchReq* req = batch[i];
         auto t_enc_end = tnow();
 
-        FILE* fp = fopen(req->out_path.c_str(), "wb");
-        if (fp) {
-            fwrite(req->out_buf.data(), 1, req->out_buf.size(), fp);
-            fclose(fp);
+        if (req->out_ptr) {
+            munmap(req->out_ptr, req->out_size);
+            req->out_ptr = nullptr;
+        }
+        if (req->out_fd >= 0) {
+            close(req->out_fd);
+            req->out_fd = -1;
         }
         auto t_wr = tnow();
 
