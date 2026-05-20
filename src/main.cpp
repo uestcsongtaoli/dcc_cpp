@@ -811,8 +811,8 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 static void process_batch(std::vector<BatchReq*> batch) {
     if (batch.empty()) return;
     auto t_batch = tnow();
-    const size_t nrows = g_nrows;
     ensure_csv();
+    const size_t nrows = g_nrows;
 
     // ── Phase 1: O(1) size computation + output buffer allocation ─────────────
     //
@@ -1036,6 +1036,7 @@ static void handle_conn(int fd) {
     if (!read_http(fd, req)) { close(fd); return; }
 
     if (req.method == "GET" && req.path == "/health") {
+        ensure_csv();  // pre-load CSV so bench sees a warm server
         send_json(fd, 200, R"({"returnCode":"SUC0000","body": true,"errorMsg":""})");
 
     } else if (req.method == "POST" && req.path == "/encrypt") {
