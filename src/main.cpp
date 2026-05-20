@@ -124,6 +124,18 @@ static std::mutex g_csv_mu;
 static std::vector<std::string> g_masked_col[4];
 static std::vector<uint16_t>    g_mask_outlen[4];  // byte length of each masked value
 
+// Fixed hex/mask output lengths per field (0 = variable; set in load_csv).
+// g_sm4_hex_fixed[f] = hex chars per row for SM4 field f; 0 if row-varies.
+// g_mask_len_fixed[m] = mask bytes per row for mask field m; 0 if row-varies.
+static uint16_t g_sm4_hex_fixed[7] = {};
+static uint16_t g_mask_len_fixed[4] = {};
+
+// Prefix sums for variable-output fields (size nrows+1; entry[0]=0).
+// g_bkey_prefix[r] = Σ_{s<r}  padlen[s]*2   (business_key hex chars, sm4idx=3)
+// g_name_prefix[r] = Σ_{s<r}  mask_outlen[s] (name mask bytes, maskidx=2)
+static std::vector<uint32_t> g_bkey_prefix;
+static std::vector<uint32_t> g_name_prefix;
+
 // Pre-computed PKCS7-padded plaintext blobs for the 7 SM4 fields.
 // Sequential memory instead of scattered std::string heap pointers →
 // hardware prefetcher friendly, avoids per-request memcpy+memset.
@@ -202,10 +214,52 @@ static void load_csv() {
     }
     auto t4 = tnow();
 
+    // ── Step 4: fixed vs variable output lengths + prefix sums ───────────────
+    //
+    // Determine which SM4/mask fields have a fixed output length for all rows.
+    // Build prefix-sum arrays for the variable ones (business_key, name).
+    // These arrays are used in process_batch Phase 1 to compute total output
+    // sizes in O(1) per request, replacing the old 300K-row per-request scan.
+    for (int f = 0; f < 7; f++) {
+        uint16_t pl0 = g_sm4_pad[f].padlen[0];
+        bool is_fixed = true;
+        for (size_t r = 1; r < g_nrows && is_fixed; r++)
+            if (g_sm4_pad[f].padlen[r] != pl0) is_fixed = false;
+        g_sm4_hex_fixed[f] = is_fixed ? (uint16_t)(pl0 * 2u) : 0u;
+    }
+    for (int m = 0; m < 4; m++) {
+        uint16_t l0 = g_mask_outlen[m][0];
+        bool is_fixed = true;
+        for (size_t r = 1; r < g_nrows && is_fixed; r++)
+            if (g_mask_outlen[m][r] != l0) is_fixed = false;
+        g_mask_len_fixed[m] = is_fixed ? l0 : 0u;
+    }
+    // business_key (sm4idx=3): variable padlen → build hex-char prefix sum
+    if (g_sm4_hex_fixed[3] == 0) {
+        g_bkey_prefix.resize(g_nrows + 1, 0u);
+        for (size_t r = 0; r < g_nrows; r++)
+            g_bkey_prefix[r + 1] = g_bkey_prefix[r] + (uint32_t)g_sm4_pad[3].padlen[r] * 2u;
+    }
+    // name (maskidx=2): variable mask length → build mask-byte prefix sum
+    if (g_mask_len_fixed[2] == 0) {
+        g_name_prefix.resize(g_nrows + 1, 0u);
+        for (size_t r = 0; r < g_nrows; r++)
+            g_name_prefix[r + 1] = g_name_prefix[r] + g_mask_outlen[2][r];
+    }
+    auto t5 = tnow();
+
     fprintf(stderr,
         "[INFO] CSV loaded: %zu rows"
-        " | open=%.1fms  parse=%.1fms  mask_pre=%.1fms  pad_pre=%.1fms  total=%.1fms\n",
-        g_nrows, tms(t0, t1), tms(t1, t2), tms(t2, t3), tms(t3, t4), tms(t0, t4));
+        " | open=%.1fms  parse=%.1fms  mask_pre=%.1fms  pad_pre=%.1fms"
+        "  prefix=%.1fms  total=%.1fms\n"
+        "[INFO] Field fixedness:"
+        "  sm4=[%d,%d,%d,%d,%d,%d,%d]hex"
+        "  mask=[%d,%d,%d,%d]B\n",
+        g_nrows, tms(t0,t1), tms(t1,t2), tms(t2,t3), tms(t3,t4),
+        tms(t4,t5), tms(t0,t5),
+        g_sm4_hex_fixed[0], g_sm4_hex_fixed[1], g_sm4_hex_fixed[2], g_sm4_hex_fixed[3],
+        g_sm4_hex_fixed[4], g_sm4_hex_fixed[5], g_sm4_hex_fixed[6],
+        g_mask_len_fixed[0], g_mask_len_fixed[1], g_mask_len_fixed[2], g_mask_len_fixed[3]);
 }
 
 static void ensure_csv() {
@@ -520,11 +574,16 @@ struct BatchReq {
     int  sm4idx[11] = {};      // SM4 field idx (0-6) or -1
     int  maskidx[11]= {};      // mask idx (0-3) or -1
 
-    // Pre-allocated output buffer.
-    // row_offset[r] = byte offset of row r in out_buf.
-    // row_offset[nrows] = total size.
-    std::string              out_buf;
-    std::vector<uint32_t>    row_offset;
+    // Output layout metadata (replaces per-request 300K-row scan).
+    // fixed_row_bytes = bytes contributed per row by fixed-size fields + commas + newline.
+    // has_bkey / has_name = whether the variable-output fields are selected.
+    // Write position for row r: r*fixed_row_bytes + g_bkey_prefix[r] + g_name_prefix[r]
+    //   (prefix terms added only when the corresponding flag is set).
+    uint32_t fixed_row_bytes = 0;
+    bool     has_bkey = false;   // business_key selected (variable padlen)
+    bool     has_name = false;   // name selected (variable mask len)
+
+    std::string out_buf;         // output buffer; allocated in Phase 1
 
     std::string out_path;
     TPoint      t_req_start;
@@ -571,6 +630,17 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 
     char* base = req->out_buf.data();
 
+    // O(1) row-start position using pre-built prefix sums (no row_offset array).
+    const uint32_t  fixed_rbs = req->fixed_row_bytes;
+    const uint32_t* bkey_pfx  = req->has_bkey ? g_bkey_prefix.data() : nullptr;
+    const uint32_t* name_pfx  = req->has_name ? g_name_prefix.data() : nullptr;
+    auto row_pos = [&](size_t r) -> uint32_t {
+        uint32_t pos = (uint32_t)r * fixed_rbs;
+        if (bkey_pfx) pos += bkey_pfx[r];
+        if (name_pfx) pos += name_pfx[r];
+        return pos;
+    };
+
     // Thread-local profiling accumulators.  Flushed to globals at end.
     uint64_t p_sm4 = 0, p_hex = 0, p_mask = 0, p_other = 0;
 
@@ -590,7 +660,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
             uint64_t t0, t1;
             if (g_profile) t0 = rdtsc();
             for (size_t b = 0; b < B; b++)
-                wp[b] = base + req->row_offset[base_row + b];
+                wp[b] = base + row_pos(base_row + b);
             if (g_profile) { t1 = rdtsc(); p_other += t1 - t0; }
 
             for (int fi = 0; fi < req->nfields; fi++) {
@@ -648,7 +718,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
             uint64_t t0, t1;
             if (g_profile) t0 = rdtsc();
             for (size_t b = 0; b < B; b++)
-                wp[b] = base + req->row_offset[base_row + b];
+                wp[b] = base + row_pos(base_row + b);
             if (g_profile) { t1 = rdtsc(); p_other += t1 - t0; }
 
             for (int fi = 0; fi < req->nfields; fi++) {
@@ -691,7 +761,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 
     // ── scalar remainder (last <16 rows, also handles g_sm4_mode==0 entirely) ─
     for (size_t r = row_start; r < row_end; r++) {
-        char* p = base + req->row_offset[r];
+        char* p = base + row_pos(r);
         uint64_t t0, t1;
         for (int fi = 0; fi < req->nfields; fi++) {
             if (fi > 0) *p++ = ',';
@@ -733,7 +803,7 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 //
 // Called ONCE per batch from a conn-pool thread (never g_compute_pool).
 //
-// Phase 1: parallel pre-computation of row_offset[] + out_buf allocation.
+// Phase 1: parallel O(1) size computation + out_buf allocation.
 // Phase 2: encrypt+mask all rows, chunk-first task ordering for L3 cache reuse.
 // Phase 3: write output files + callbacks.
 
@@ -743,25 +813,48 @@ static void process_batch(std::vector<BatchReq*> batch) {
     const size_t nrows = g_nrows;
     ensure_csv();
 
-    // ── Phase 1: row offsets + output buffer allocation ───────────────────────
+    // ── Phase 1: O(1) size computation + output buffer allocation ─────────────
+    //
+    // Most SM4 fields have a fixed padlen for all rows (user_id, serial_no,
+    // user_code, device_id, trans_id, secret_code).  business_key is the only
+    // SM4 field with variable padlen.  Mask fields id_card, phone, email produce
+    // a fixed-length output; only name varies.
+    //
+    // g_sm4_hex_fixed[f] and g_mask_len_fixed[m] are set in load_csv.
+    // g_bkey_prefix / g_name_prefix are their cumulative sums (size nrows+1).
+    //
+    // Per-request total size = nrows*fixed_row_bytes
+    //                        + g_bkey_prefix[nrows]  (if business_key selected)
+    //                        + g_name_prefix[nrows]  (if name selected)
+    // No 300K-row loop needed.  Page faults from resize() happen here in Phase 1
+    // (parallelized across compute workers) rather than lazily in Phase 2.
     submit_and_wait(batch.size(), [&](size_t i) {
         BatchReq* req = batch[i];
-        req->row_offset.resize(nrows + 1);
-        uint32_t off = 0;
-        for (size_t r = 0; r < nrows; r++) {
-            req->row_offset[r] = off;
-            uint32_t rsz = 1; // newline
-            for (int fi = 0; fi < req->nfields; fi++) {
-                if (fi > 0) rsz++;
-                if (req->is_sm4[fi])
-                    rsz += (uint32_t)g_sm4_pad[req->sm4idx[fi]].padlen[r] * 2u;
-                else
-                    rsz += g_mask_outlen[req->maskidx[fi]][r];
+
+        // Count fixed output bytes per row: commas + newline + fixed-field output.
+        uint32_t fixed = 1;  // newline
+        for (int fi = 0; fi < req->nfields; fi++) {
+            if (fi > 0) fixed++;          // comma separator
+            if (req->is_sm4[fi]) {
+                uint16_t h = g_sm4_hex_fixed[req->sm4idx[fi]];
+                if (h)   fixed += h;
+                else     req->has_bkey = true;  // sm4idx==3: business_key
+            } else {
+                uint16_t m = g_mask_len_fixed[req->maskidx[fi]];
+                if (m)   fixed += m;
+                else     req->has_name = true;  // maskidx==2: name
             }
-            off += rsz;
         }
-        req->row_offset[nrows] = off;
-        req->out_buf.resize(off);
+        req->fixed_row_bytes = fixed;
+
+        // O(1) total output size via global prefix sums.
+        uint32_t total = (uint32_t)nrows * fixed;
+        if (req->has_bkey) total += g_bkey_prefix[nrows];
+        if (req->has_name) total += g_name_prefix[nrows];
+
+        // Allocate.  std::string::resize zero-inits → page faults triggered here,
+        // parallelized across all compute workers, not serialized in Phase 2.
+        req->out_buf.resize(total);
     });
     auto t_alloc = tnow();
 
@@ -939,7 +1032,6 @@ static void handle_conn(int fd) {
     if (!read_http(fd, req)) { close(fd); return; }
 
     if (req.method == "GET" && req.path == "/health") {
-        ensure_csv();
         send_json(fd, 200, R"({"returnCode":"SUC0000","body": true,"errorMsg":""})");
 
     } else if (req.method == "POST" && req.path == "/encrypt") {
