@@ -89,6 +89,86 @@ void sm4_cbc_encrypt_x16_nopad(
     }
 }
 
+// ── 1-block specialization ────────────────────────────────────────────────────
+// All 16 chains = exactly 1 SM4 block (16 bytes). No CBC carry needed.
+// pt_be[i] → 4 pre-bswapped words; no branch, no bswap in hot loop.
+void sm4_cbc_encrypt_x16_1blk(
+    const SM4Ctx&         ctx,
+    const uint8_t         iv[16],
+    const uint32_t* const pt_be[16],
+    uint8_t* const        ct[16])
+{
+    uint32_t iv_w[4];
+    for (int j = 0; j < 4; ++j) iv_w[j] = load_be32(iv + j*4);
+
+    alignas(64) uint32_t col[16];
+    alignas(64) uint32_t ct_col[16];
+
+    __m512i st[4];
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 16; ++i)
+            col[i] = pt_be[i][j] ^ iv_w[j];
+        st[j] = _mm512_load_si512((const __m512i*)col);
+    }
+    sm4_ecb_x16(ctx, st);
+    for (int j = 0; j < 4; ++j) {
+        _mm512_store_si512((__m512i*)ct_col, st[j]);
+        for (int i = 0; i < 16; ++i)
+            store_be32(ct[i] + j*4, ct_col[i]);
+    }
+}
+
+// ── 2-block specialization ────────────────────────────────────────────────────
+// Chains have ct_len[i] ∈ {16, 32}. Block 0 runs unconditionally.
+// Block 1 always runs (avoids branch in innermost loop) but stores only where
+// ct_len[i] >= 32. For ct_len[i]==16 chains, pt_be[i][4..7] reads adjacent
+// row data or sentinel zeros — valid memory, discarded output.
+void sm4_cbc_encrypt_x16_2blk(
+    const SM4Ctx&         ctx,
+    const uint8_t         iv[16],
+    const uint32_t* const pt_be[16],
+    const size_t          ct_len[16],
+    uint8_t* const        ct[16])
+{
+    uint32_t iv_w[4];
+    for (int j = 0; j < 4; ++j) iv_w[j] = load_be32(iv + j*4);
+
+    alignas(64) uint32_t col[16];
+    alignas(64) uint32_t ct_col[16];
+    alignas(64) uint32_t prev[4][16];
+
+    // ── Block 0 ──────────────────────────────────────────────────────────────
+    __m512i st[4];
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 16; ++i)
+            col[i] = pt_be[i][j] ^ iv_w[j];
+        st[j] = _mm512_load_si512((const __m512i*)col);
+    }
+    sm4_ecb_x16(ctx, st);
+    for (int j = 0; j < 4; ++j) {
+        _mm512_store_si512((__m512i*)ct_col, st[j]);
+        for (int i = 0; i < 16; ++i) {
+            prev[j][i] = ct_col[i];
+            store_be32(ct[i] + j*4, ct_col[i]);
+        }
+    }
+
+    // ── Block 1 ──────────────────────────────────────────────────────────────
+    for (int j = 0; j < 4; ++j) {
+        for (int i = 0; i < 16; ++i)
+            col[i] = pt_be[i][4+j] ^ prev[j][i];
+        st[j] = _mm512_load_si512((const __m512i*)col);
+    }
+    sm4_ecb_x16(ctx, st);
+    for (int j = 0; j < 4; ++j) {
+        _mm512_store_si512((__m512i*)ct_col, st[j]);
+        for (int i = 0; i < 16; ++i) {
+            if (ct_len[i] >= 32)
+                store_be32(ct[i] + 16 + j*4, ct_col[i]);
+        }
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 void sm4_cbc_encrypt_x16(
     const SM4Ctx&        ctx,

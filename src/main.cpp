@@ -94,6 +94,7 @@ struct SM4PaddedField {
     std::vector<uint32_t> offset;  // byte offset in blob for row r
     std::vector<uint16_t> padlen;  // PKCS7 padded length for row r (multiple of 16)
     std::vector<uint8_t>  blob;    // concatenated PKCS7-padded plaintexts
+    std::vector<uint32_t> blob_be; // same data as pre-bswapped uint32 BE words + 8 sentinel zeros
 };
 static SM4PaddedField g_sm4_pad[7];
 
@@ -162,6 +163,14 @@ static void load_csv() {
             memcpy(dst, g_cols[col][r].data(), plen);
             memset(dst + plen, pad, pad);
         }
+        // Pre-bswap into blob_be so the hot AVX-512 path loads uint32 directly.
+        // 8 sentinel zeros appended so 2-block path can read past 1-block entries safely.
+        g_sm4_pad[f].blob_be.resize(total / 4 + 8, 0u);
+        const uint8_t* bs = g_sm4_pad[f].blob.data();
+        uint32_t*      bw = g_sm4_pad[f].blob_be.data();
+        for (uint32_t wi = 0; wi < total / 4; ++wi)
+            bw[wi] = ((uint32_t)bs[wi*4+0] << 24) | ((uint32_t)bs[wi*4+1] << 16)
+                   | ((uint32_t)bs[wi*4+2] <<  8) |  (uint32_t)bs[wi*4+3];
     }
     auto t4 = tnow();
 
@@ -526,9 +535,10 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
 
     // Ciphertext staging (stack): max 4 SM4 blocks = 64 bytes per chain
     alignas(64) uint8_t ct_s[B][64];
-    const uint8_t* pt_p[B];
-    size_t         ct_l[B];
-    uint8_t*       ct_p[B];
+    const uint8_t*  pt_p[B];    // byte pointers (generic fallback)
+    const uint32_t* pt_be_p[B]; // pre-bswapped word pointers (fast path)
+    size_t          ct_l[B];
+    uint8_t*        ct_p[B];
     for (size_t b = 0; b < B; b++) ct_p[b] = ct_s[b];
 
     const size_t full = row_start + ((row_end - row_start) / B) * B;
@@ -546,12 +556,26 @@ static void compute_rows(BatchReq* req, size_t row_start, size_t row_end) {
             if (req->is_sm4[fi]) {
                 int sidx = req->sm4idx[fi];
                 const SM4PaddedField& spf = g_sm4_pad[sidx];
+                size_t max_blks = 0;
                 for (size_t b = 0; b < B; b++) {
                     size_t r = base_row + b;
-                    pt_p[b] = spf.blob.data() + spf.offset[r];
+                    pt_be_p[b] = spf.blob_be.data() + (spf.offset[r] >> 2);
                     ct_l[b] = spf.padlen[r];
+                    size_t nb = ct_l[b] >> 4;
+                    if (nb > max_blks) max_blks = nb;
                 }
-                sm4_cbc_encrypt_x16_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+                if (max_blks == 1)
+                    sm4_cbc_encrypt_x16_1blk(req->ctx, SM4_IV, pt_be_p, ct_p);
+                else if (max_blks == 2)
+                    sm4_cbc_encrypt_x16_2blk(req->ctx, SM4_IV, pt_be_p, ct_l, ct_p);
+                else {
+                    // Rare fallback: fields wider than 32 bytes
+                    for (size_t b = 0; b < B; b++) {
+                        size_t r = base_row + b;
+                        pt_p[b] = spf.blob.data() + spf.offset[r];
+                    }
+                    sm4_cbc_encrypt_x16_nopad(req->ctx, SM4_IV, pt_p, ct_l, ct_p);
+                }
                 for (size_t b = 0; b < B; b++) {
                     if (ct_l[b] == 0) continue;
                     hex_encode(ct_s[b], wp[b], ct_l[b]);

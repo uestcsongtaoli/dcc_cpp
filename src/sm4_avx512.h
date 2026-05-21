@@ -26,3 +26,22 @@ void sm4_cbc_encrypt_x16_nopad(
     const uint8_t* const pt[16],
     const size_t         ct_len[16],
     uint8_t* const       ct[16]);
+
+// 1-block specialization: all 16 chains have exactly 16-byte ciphertext.
+// pt_be[i] points to 4 pre-bswapped uint32 words (from SM4PaddedField::blob_be).
+void sm4_cbc_encrypt_x16_1blk(
+    const SM4Ctx&         ctx,
+    const uint8_t         iv[16],
+    const uint32_t* const pt_be[16],
+    uint8_t* const        ct[16]);
+
+// 2-block specialization: chains have 16 or 32 bytes of ciphertext (ct_len[i] ∈ {16,32}).
+// pt_be[i] points to 4 or 8 pre-bswapped uint32 words.
+// For chains with ct_len[i]==16, words [4..7] are read (adjacent data / sentinel zeros) —
+// safe because blob_be has 8 trailing sentinel zeros; ECB result is discarded for those chains.
+void sm4_cbc_encrypt_x16_2blk(
+    const SM4Ctx&         ctx,
+    const uint8_t         iv[16],
+    const uint32_t* const pt_be[16],
+    const size_t          ct_len[16],
+    uint8_t* const        ct[16]);
